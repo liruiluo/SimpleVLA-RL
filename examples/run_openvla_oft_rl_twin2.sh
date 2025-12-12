@@ -7,6 +7,32 @@ export TOKENIZERS_PARALLELISM=true
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_USE_CUDA_DSA=1
 export ROBOT_PLATFORM=ALOHA  # Use LIBERO: ROBOT_PLATFORM=LIBERO  Use Robotwin ROBOT_PLATFORM=ALOHA
+
+# TensorFlow/XLA is used in image preprocessing (crop/resize). On some clusters,
+# XLA can't find NVVM libdevice unless `XLA_FLAGS` is set.
+# You can override explicitly with: `export XLA_GPU_CUDA_DATA_DIR=/path/to/cuda`.
+if [[ "${XLA_FLAGS:-}" != *"--xla_gpu_cuda_data_dir="* ]]; then
+    _candidate_cuda_dirs=()
+    for _d in "${XLA_GPU_CUDA_DATA_DIR:-}" "${CUDA_HOME:-}" "${CUDA_DIR:-}" "${CUDA_PATH:-}"; do
+        if [ -n "${_d}" ]; then
+            _candidate_cuda_dirs+=("${_d}")
+        fi
+    done
+    if command -v nvcc >/dev/null 2>&1; then
+        _nvcc_path="$(command -v nvcc)"
+        _nvcc_real="$(readlink -f "${_nvcc_path}" 2>/dev/null || echo "${_nvcc_path}")"
+        _candidate_cuda_dirs+=("$(cd "$(dirname "${_nvcc_real}")/.." && pwd)")
+    fi
+    _candidate_cuda_dirs+=("/cm/shared/apps/cuda12.2" "/usr/local/cuda" "/usr/local/cuda-12.2" "/usr/lib/cuda")
+
+    for _cuda_dir in "${_candidate_cuda_dirs[@]}"; do
+        if [ -f "${_cuda_dir}/nvvm/libdevice/libdevice.10.bc" ]; then
+            export XLA_FLAGS="--xla_gpu_cuda_data_dir=${_cuda_dir} ${XLA_FLAGS:-}"
+            echo "Set XLA_FLAGS for TF/XLA: ${XLA_FLAGS}"
+            break
+        fi
+    done
+fi
 PROJECT_NAME='SimpleVLA-RL'
 EXPERIMENT_NAME='MODIFIED YOURSELF e.g. twin2_lift_pot_sft1k_rl_tmp16_clip08-128_batch64' 
 # For openvla-oft Libero-Long traj1 SFT or traj all SFT models can be find in https://huggingface.co/collections/Haozhan72/simplevla-rl-6833311430cd9df52aeb1f86
@@ -93,5 +119,4 @@ HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     trainer.runtime_env=$ALIGN_PATH \
     trainer.wandb_mode=online \
     trainer.val_before_train=True \
-
 

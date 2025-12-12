@@ -37,6 +37,33 @@ export CUDA_LAUNCH_BLOCKING=1
 export TORCH_USE_CUDA_DSA=1
 export ROBOT_PLATFORM=LIBERO # Use LIBERO: ROBOT_PLATFORM=LIBERO  Use Robotwin ROBOT_PLATFORM=ALOHA
 
+# TensorFlow/XLA is used in image preprocessing (see `verl/utils/libero_utils.py`).
+# On some clusters, XLA can't find NVVM libdevice unless `XLA_FLAGS` is set.
+# You can override explicitly with: `export XLA_GPU_CUDA_DATA_DIR=/path/to/cuda`.
+if [[ "${XLA_FLAGS:-}" != *"--xla_gpu_cuda_data_dir="* ]]; then
+    _candidate_cuda_dirs=()
+    for _d in "${XLA_GPU_CUDA_DATA_DIR:-}" "${CUDA_HOME:-}" "${CUDA_DIR:-}" "${CUDA_PATH:-}"; do
+        if [ -n "${_d}" ]; then
+            _candidate_cuda_dirs+=("${_d}")
+        fi
+    done
+    if command -v nvcc >/dev/null 2>&1; then
+        _nvcc_path="$(command -v nvcc)"
+        _nvcc_real="$(readlink -f "${_nvcc_path}" 2>/dev/null || echo "${_nvcc_path}")"
+        _candidate_cuda_dirs+=("$(cd "$(dirname "${_nvcc_real}")/.." && pwd)")
+    fi
+    # Common CUDA install locations (will only be used if they contain libdevice)
+    _candidate_cuda_dirs+=("/cm/shared/apps/cuda12.2" "/usr/local/cuda" "/usr/local/cuda-12.2" "/usr/lib/cuda")
+
+    for _cuda_dir in "${_candidate_cuda_dirs[@]}"; do
+        if [ -f "${_cuda_dir}/nvvm/libdevice/libdevice.10.bc" ]; then
+            export XLA_FLAGS="--xla_gpu_cuda_data_dir=${_cuda_dir} ${XLA_FLAGS:-}"
+            echo "Set XLA_FLAGS for TF/XLA: ${XLA_FLAGS}"
+            break
+        fi
+    done
+fi
+
 # Basic experiment identifiers (can be overridden by env vars)
 PROJECT_NAME="${PROJECT_NAME:-SimpleVLA-RL}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-lib10_openvla_oft_rl}"
