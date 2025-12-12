@@ -494,8 +494,14 @@ class RobHFRollout(BaseRollout):
             micro_batch_size = self.config.val_micro_batch_size if self.config.val_micro_batch_size is not None else 1
         else:
             micro_batch_size = self.config.get('micro_batch_size', batch_size)
-            
-        num_chunks = max(batch_size // micro_batch_size, 1)
+
+        # TensorDict.chunk returns fewer chunks if chunks > batch_size.
+        # Clamp micro_batch_size and num_chunks to avoid DataProto.chunk assertion failures.
+        if micro_batch_size is None or micro_batch_size <= 0:
+            micro_batch_size = batch_size
+        micro_batch_size = min(int(micro_batch_size), int(batch_size)) if batch_size > 0 else 1
+        num_chunks = max((batch_size + micro_batch_size - 1) // micro_batch_size, 1)
+        num_chunks = min(int(num_chunks), int(batch_size)) if batch_size > 0 else 1
         batch_prompts = prompts.chunk(chunks=num_chunks)
         output = [self._generate_minibatch(p) for p in batch_prompts]
         output = DataProto.concat(output)
