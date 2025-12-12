@@ -131,3 +131,15 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 logs
 log
 outputs
+
+# Large model checkpoints / weights (keep out of git to speed tooling snapshots)
+models/
+models/**
+**/*.safetensors
+**/*.bin
+**/*.pth
+
+# RL / Ray artifacts
+runs/
+ray_results/
+ray_session*/

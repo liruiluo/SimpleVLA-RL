@@ -1,25 +1,93 @@
+#!/bin/bash
 set -x
 
+# Determine repo root.
+# 优先使用外部传入的 REPO_ROOT；否则根据当前工作目录推断：
+# - 若当前目录本身是仓库根（包含 verl/ 和 examples/），用 $PWD
+# - 若上一级目录是仓库根，用 $PWD/..
+if [ -z "${REPO_ROOT:-}" ]; then
+    if [ -d "$PWD/verl" ] && [ -d "$PWD/examples" ]; then
+        REPO_ROOT="$PWD"
+    elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
+        REPO_ROOT="$(cd "$PWD/.." && pwd)"
+    else
+        # Fallback: use script location (可能在 Slurm spool 下，仅作为兜底)
+        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    fi
+fi
+
+# ---- Environment setup (Python / Conda) ----
+# Ensure user shell init is loaded so that `conda` is available
+if [ -f "$HOME/.bashrc" ]; then
+    source "$HOME/.bashrc"
+fi
+
+# Activate the repo-local Conda env via helper script (if present)
+if [ -f "${REPO_ROOT}/activate_env.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${REPO_ROOT}/activate_env.sh"
+else
+    echo "WARNING: ${REPO_ROOT}/activate_env.sh not found. Skipping environment activation."
+fi
+
 export NCCL_DEBUG=WARN 
-export WANDB_API_KEY='YOUR WANDB KEY'
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=true
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_USE_CUDA_DSA=1
 export ROBOT_PLATFORM=LIBERO # Use LIBERO: ROBOT_PLATFORM=LIBERO  Use Robotwin ROBOT_PLATFORM=ALOHA
-PROJECT_NAME='SimpleVLA-RL'
-EXPERIMENT_NAME='MODIFIED YOURSELF e.g. vla-lib10_model10j_lr10_tmp16_nsample8_clip08-128_batch64_ppominibs128_node2' 
-# For openvla-oft Libero-Long traj1 SFT or traj all SFT models can be find in https://huggingface.co/collections/Haozhan72/simplevla-rl-6833311430cd9df52aeb1f86
-SFT_MODEL_PATH="YOUR SFT_MODEL_PATH"
-CKPT_PATH="THE PATH YOU WANT TO SAVE YOUR CKPT"
+
+# Basic experiment identifiers (can be overridden by env vars)
+PROJECT_NAME="${PROJECT_NAME:-SimpleVLA-RL}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-lib10_openvla_oft_rl}"
+
+# Default paths:
+# - SFT_MODEL_PATH points to the included Libero-10 SFT checkpoint
+# - CKPT_PATH is where RL checkpoints will be saved
+SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/Openvla-oft-SFT-libero10-traj1}"
+CKPT_PATH="${CKPT_PATH:-${REPO_ROOT}/runs}"
+
 # DATASET_NAME can be libero_10 (libero_Long), libero_90, libero_spatial, libero_object, libero_goal
-DATASET_NAME="libero_10"
-VLA_NAME="openvla-oft"
-NUM_GPUS=8
+DATASET_NAME="${DATASET_NAME:-libero_10}"
+VLA_NAME="${VLA_NAME:-openvla-oft}"
+
+# GPU / node settings
+# 优先使用外部传入的 NUM_GPUS；否则从 Slurm / CUDA_VISIBLE_DEVICES 自动推断
+if [ -z "${NUM_GPUS:-}" ]; then
+    if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
+        NUM_GPUS="${SLURM_GPUS_ON_NODE}"
+    elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        IFS=',' read -ra _CUDA_DEVICES <<< "$CUDA_VISIBLE_DEVICES"
+        NUM_GPUS="${#_CUDA_DEVICES[@]}"
+    else
+        NUM_GPUS=1
+    fi
+fi
+
 # If you want to use 2*8 GPU to RL. Set NUM_NODES=2
-NUM_NODES=1 
-ALIGN_PATH="YOUR PATH TO SimpleVLA-RL/align.json"
-bash examples/overwrite_vla_ckpt_utils.sh $SFT_MODEL_PATH 
+NUM_NODES="${NUM_NODES:-1}"
+
+# Ray runtime env config (used to pass env vars like WANDB_API_KEY)
+ALIGN_PATH="${ALIGN_PATH:-${REPO_ROOT}/align.json}"
+
+# WandB logging:
+# - 默认启用 WandB（假设你已经在登录节点上运行过 `wandb login`）
+# - 如需禁用 WandB，可在提交前 `export DISABLE_WANDB=1`
+if [ -n "${DISABLE_WANDB:-}" ]; then
+    LOGGER="['console']"
+    WANDB_MODE="disabled"
+    echo "DISABLE_WANDB is set; WandB logging disabled."
+else
+    LOGGER="['console','wandb']"
+    WANDB_MODE="${WANDB_MODE:-online}"
+    echo "Using WandB logging. Make sure you have run 'wandb login'."
+fi
+
+# Make sure ckpt base dir exists
+mkdir -p "${CKPT_PATH}/${PROJECT_NAME}/${EXPERIMENT_NAME}"
+
+# Ensure the VLA checkpoint has the latest OpenVLA-OFT code
+bash "${REPO_ROOT}/examples/overwrite_vla_ckpt_utils.sh" "$SFT_MODEL_PATH"
 
 HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     data.task_suite_name=$DATASET_NAME \
@@ -73,7 +141,7 @@ HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.00 \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=$LOGGER \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME \
@@ -87,7 +155,5 @@ HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     algorithm.adv_params.verifier_gamma=1.0 \
     algorithm.adv_params.reward_model_gamma=1.0 \
     trainer.runtime_env=$ALIGN_PATH \
-    trainer.wandb_mode=online \
+    trainer.wandb_mode=$WANDB_MODE \
     trainer.val_before_train=True \
-
-
