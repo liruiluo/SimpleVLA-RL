@@ -45,13 +45,29 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HUB_CACHE}"
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-$HF_HOME/modules}"
 echo "HF_HOME=$HF_HOME"
 
-# Optionally add LIBERO source tree to PYTHONPATH so that `import libero` works
+# Optionally add LIBERO source tree to PYTHONPATH so that `import libero` works.
 # You can override LIBERO_ROOT before sourcing this script if your path differs.
 LIBERO_ROOT_DEFAULT="/share/ml/luolirui/LIBERO"
-LIBERO_ROOT="${LIBERO_ROOT:-$LIBERO_ROOT_DEFAULT}"
+if [ -z "${LIBERO_ROOT+x}" ]; then
+    LIBERO_ROOT="$LIBERO_ROOT_DEFAULT"
+    _LIBERO_ROOT_FROM_ENV=0
+else
+    _LIBERO_ROOT_FROM_ENV=1
+fi
+
+# If the default path is missing, try common local layouts:
+#   your_workspace/
+#   ├── SimpleVLA-RL/   (this repo)
+#   └── LIBERO/
+if [ "$_LIBERO_ROOT_FROM_ENV" -eq 0 ] && [ ! -d "$LIBERO_ROOT" ]; then
+    _LIBERO_SIBLING="${REPO_ROOT_ACTIVATE}/../LIBERO"
+    if [ -d "$_LIBERO_SIBLING" ]; then
+        LIBERO_ROOT="$_LIBERO_SIBLING"
+    fi
+fi
 
 if [ -d "$LIBERO_ROOT" ]; then
-    case ":$PYTHONPATH:" in
+    case ":${PYTHONPATH:-}:" in
         *":$LIBERO_ROOT:"*) ;;
         *) export PYTHONPATH="$LIBERO_ROOT${PYTHONPATH:+:$PYTHONPATH}";;
     esac
