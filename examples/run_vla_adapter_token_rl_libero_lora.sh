@@ -211,7 +211,7 @@ ALIGN_PATH="$ALIGN_PATH" TRAINER_RUNTIME_ENV="$TRAINER_RUNTIME_ENV" HYDRA_FULL_E
     actor_rollout_ref.rollout.log_prob_micro_batch_size=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=hf \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.98 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.00 \

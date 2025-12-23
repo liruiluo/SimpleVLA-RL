@@ -628,6 +628,12 @@ class RobActorRolloutRefWorker(Worker):
                         old_log_probs = self.actor.compute_log_prob(data=out)
                         out.batch['old_log_probs'] = old_log_probs
 
+                    # Reduce Ray/object-store RAM pressure: cache image tensors in bf16 on CPU.
+                    # This does not change rollout sampling behavior (no grad), but reduces peak host memory
+                    # when accumulating `train_batch_size * n_samples` trajectories.
+                    if 'pixel_values' in out.batch and torch.is_tensor(out.batch['pixel_values']):
+                        out.batch['pixel_values'] = out.batch['pixel_values'].to(dtype=torch.bfloat16)
+
                     outputs.append(out.to('cpu'))
                     # Free intermediate GPU buffers between chunks.
                     torch.cuda.empty_cache()
