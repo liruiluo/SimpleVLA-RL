@@ -30,14 +30,15 @@ from .base import BaseRollout
 from transformers import GenerationConfig, AutoProcessor
 
 from verl.utils.libero_utils import save_rollout_video
-try:
-    from verl.utils.libero_utils import (
-        get_libero_env, get_libero_dummy_action, get_libero_image, 
-        get_libero_wrist_image, quat2axisangle, normalize_gripper_action, 
-        invert_gripper_action
-    )
-except ImportError as e:
-    print(f"Warning : can't import libero: {e}")
+from verl.utils.libero_utils import (
+    get_libero_env,
+    get_libero_dummy_action,
+    get_libero_image,
+    get_libero_wrist_image,
+    invert_gripper_action,
+    normalize_gripper_action,
+    quat2axisangle,
+)
     
 from verl.utils.vla_utils.openvla_oft.constants import (
     ACTION_DIM,
@@ -333,29 +334,40 @@ class RobotwinEnvWrapper:
 
 def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, is_valid, global_steps, max_steps):
     """Worker process for Libero environments"""
-    from libero.libero import benchmark
+    from verl.utils.stdout_filter import filter_std_streams
+    import os
+    import sys
+
+    noisy_substrings = (
+        "[Warning]: datasets path ",
+        "[info] using task orders ",
+        "datasets path ",
+        "using task orders ",
+    )
+
+    vla_adapter_repo_path = os.environ.get("VLA_ADAPTER_REPO_PATH", "").strip()
+    if vla_adapter_repo_path:
+        libero_root = os.path.join(vla_adapter_repo_path, "LIBERO")
+        if libero_root not in sys.path:
+            sys.path.insert(0, libero_root)
+
+    try:
+        from libero.libero import benchmark
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Cannot import `libero`. Install LIBERO as a site-package, or export "
+            "`VLA_ADAPTER_REPO_PATH=/path/to/VLA-Adapter` (so `${VLA_ADAPTER_REPO_PATH}/LIBERO` is importable)."
+        ) from e
+
+    with filter_std_streams(noisy_substrings):
+        benchmark_dict = benchmark.get_benchmark_dict()
+        task_suite = benchmark_dict[task_name]()
+        task = task_suite.get_task(task_id)
+        initial_states = task_suite.get_task_init_states(task_id)
+        initial_state = initial_states[trial_id]
     
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[task_name]()
-    task = task_suite.get_task(task_id)
-    initial_states = task_suite.get_task_init_states(task_id)
-    initial_state = initial_states[trial_id]
-    
-    env = None
-    while True:
-        try:
-            env, task_description = get_libero_env(task, config.model_family, resolution=256)
-            break
-        except:
-            print(f"*** env initialization failed ***")
-            if env is not None:
-                try:
-                    env.close()
-                except Exception as e:
-                    print(f"error when close the env: {e}")
-            torch.cuda.empty_cache()
-            gc.collect()
-            print("gc collect finish")
+    with filter_std_streams(noisy_substrings):
+        env, task_description = get_libero_env(task, config.model_family, resolution=256)
     
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -454,7 +466,11 @@ class RobHFRollout(BaseRollout):
             "robotwin2_place_shoe": 250,
             "robotwin2_move_pillbottle_pad": 200,
         }
-        self.processor = AutoProcessor.from_pretrained(config.pretrained_checkpoint, trust_remote_code=True)
+        if self.config.vla == "vla-adapter-token":
+            from verl.utils.vla_utils.vla_adapter_token import ensure_hf_trust_remote_code_safe_path
+
+            self.config.pretrained_checkpoint = ensure_hf_trust_remote_code_safe_path(self.config.pretrained_checkpoint)
+        self.processor = AutoProcessor.from_pretrained(self.config.pretrained_checkpoint, trust_remote_code=True)
         self.vla_preprocess()
         
         # Setup execution pool based on task suite
@@ -479,13 +495,19 @@ class RobHFRollout(BaseRollout):
                 for gpu in gpus:
                     tf.config.experimental.set_memory_growth(gpu, True)
         
-        if self.config.vla in ["openvla-oft"]:
+        if self.config.vla in ["openvla-oft", "vla-adapter-token"]:
             if "libero" in self.config.task_suite_name:
-                if self.config.unnorm_key not in self.module.norm_stats and f"{self.config.unnorm_key}_no_noops" in self.module.norm_stats:
+                if (
+                    self.config.unnorm_key not in self.module.norm_stats
+                    and f"{self.config.unnorm_key}_no_noops" in self.module.norm_stats
+                ):
                     self.config.unnorm_key = f"{self.config.unnorm_key}_no_noops"
             elif "robotwin" in self.config.task_suite_name:
                 self.config.unnorm_key = self.config.unnorm_key.removeprefix("robotwin_").removeprefix("robotwin2_")
-            assert self.config.unnorm_key in self.module.norm_stats, f"Action un-norm key {self.config.unnorm_key} not found in VLA `norm_stats`!"
+
+            assert (
+                self.config.unnorm_key in self.module.norm_stats
+            ), f"Action un-norm key {self.config.unnorm_key} not found in VLA `norm_stats`!"
 
     def generate_sequences(self, prompts):
         batch_size = prompts.batch.batch_size[0]
@@ -515,7 +537,19 @@ class RobHFRollout(BaseRollout):
             image = Image.fromarray(input_data["full_image"]).convert("RGB")
             if self.config.center_crop:
                 image = center_crop_image(image)
-            prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
+
+            # Prompt format: VLA-Adapter token models are typically trained with Qwen chat formatting (`use_minivlm`).
+            use_minivlm = bool(getattr(self.config, "use_minivlm", False))
+            if self.config.vla == "vla-adapter-token" and use_minivlm:
+                prompt = (
+                    "<|im_start|>system\n"
+                    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+                    "<|im_start|>user\n"
+                    f"What action should the robot take to {task_description.lower()}?<|im_end|>\n"
+                    "<|im_start|>assistant\n"
+                )
+            else:
+                prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
             batch_feature = self.processor(prompt, image)
             
             pixel_values_list = [batch_feature["pixel_values"]]
@@ -545,7 +579,9 @@ class RobHFRollout(BaseRollout):
             attention_mask = batch_feature["attention_mask"]
             pixel_values = batch_feature["pixel_values"]
             
-            if not torch.all(input_ids[:, -1] == 29871):
+            # NOTE: OpenVLA-OFT (LLaMA-style) training expects an extra whitespace token (29871) after "Out:".
+            # VLA-Adapter token models (Qwen) and some other variants do not.
+            if self.config.vla in ["openvla-oft"] and not torch.all(input_ids[:, -1] == 29871):
                 input_ids = torch.cat(
                     (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
                 )
@@ -587,6 +623,27 @@ class RobHFRollout(BaseRollout):
             if self.config.use_proprio and "robotwin" in self.config.task_suite_name:
                 batchdata["proprio"] = torch.stack(batchdata["proprio"], dim=0).to(device)
                 
+            assert torch.all(batchdata["attention_mask"].ne(0) == batchdata["input_ids"].ne(self.processor.tokenizer.pad_token_id))
+        elif self.config.vla in ["vla-adapter-token"]:
+            # VLA-Adapter token models are not guaranteed to produce identical prompt lengths across tasks.
+            # We right-pad here and keep prompt tokens left-aligned (required by our action-token slicing logic).
+            batchdata["input_ids"] = [x.squeeze(0) for x in batchdata["input_ids"]]
+            batchdata["attention_mask"] = [x.squeeze(0) for x in batchdata["attention_mask"]]
+            batchdata["input_ids"] = pad_sequence(
+                batchdata["input_ids"],
+                batch_first=True,
+                padding_value=self.processor.tokenizer.pad_token_id,
+            ).to(device)
+            batchdata["attention_mask"] = pad_sequence(
+                batchdata["attention_mask"],
+                batch_first=True,
+                padding_value=0,
+            ).to(device)
+            batchdata["pixel_values"] = torch.cat(batchdata["pixel_values"], dim=0).to(device)
+
+            if self.config.use_proprio and "robotwin" in self.config.task_suite_name:
+                batchdata["proprio"] = torch.stack(batchdata["proprio"], dim=0).to(device)
+
             assert torch.all(batchdata["attention_mask"].ne(0) == batchdata["input_ids"].ne(self.processor.tokenizer.pad_token_id))
         else:
             for key in ["input_ids", "attention_mask", "pixel_values"]:
@@ -807,7 +864,14 @@ class RobHFRollout(BaseRollout):
         valid_video = defaultdict(list)
         
         for idx in range(batch_size):
-            init_data = output_queues[idx].get(timeout=120)
+            try:
+                init_data = output_queues[idx].get(timeout=120)
+            except queue.Empty as e:
+                for p in processes:
+                    p.terminate()
+                raise RuntimeError(
+                    "LIBERO env worker init timed out after 120s."
+                ) from e
             assert init_data['type'] == 'init'
             task_descriptions.append(init_data["task_description"])
             inputs.append(self._obs_to_input(init_data['obs'], is_robotwin=False))
@@ -849,7 +913,14 @@ class RobHFRollout(BaseRollout):
             
             new_inputs = inputs.copy()
             for idx in active_indices:
-                result = output_queues[idx].get(timeout=30)
+                try:
+                    result = output_queues[idx].get(timeout=120)
+                except queue.Empty as e:
+                    for p in processes:
+                        p.terminate()
+                    raise RuntimeError(
+                        "LIBERO env worker step timed out after 120s."
+                    ) from e
                 assert result['type'] == 'step'
                 new_inputs[idx] = self._obs_to_input(result['obs'], is_robotwin=False)
                 task_records[idx]['active'] = result['active']
@@ -919,6 +990,8 @@ class RobHFRollout(BaseRollout):
             return self._generate_one_step_oft(prompts)
         elif self.config.vla == "openvla":
             return self._generate_one_step_openvla(prompts)
+        elif self.config.vla == "vla-adapter-token":
+            return self._generate_one_step_vla_adapter_token(prompts)
         else:
             raise ValueError(f"Unknown VLA type: {self.config.vla}")
     
@@ -1081,6 +1154,201 @@ class RobHFRollout(BaseRollout):
         }
         
         return batch
+
+    def _generate_one_step_vla_adapter_token(self, prompts: dict):
+        """Generate one step for VLA-Adapter token models (Qwen) via action-token logits."""
+        idx = prompts["input_ids"]
+        attention_mask = prompts["attention_mask"]
+        pixel_values = prompts["pixel_values"]
+        proprio = prompts.get("proprio", None)
+
+        do_sample = prompts.get("do_sample", self.config.do_sample)
+        temperature = float(prompts.get("temperature", self.config.temperature))
+        if temperature <= 0:
+            temperature = 1.0
+
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+
+        with param_ctx:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                actions, response_ids = self._predict_vla_adapter_token_actions(
+                    input_ids=idx,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    unnorm_key=self.config.unnorm_key,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                )
+
+        # Keep prompt tensors right-padded (NOT left-padded) for later logprob computation.
+        idx = verl_F.pad_sequence_to_length(
+            idx,
+            max_seq_len=self.config.max_prompt_length,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+            left_pad=False,
+        )
+        attention_mask = verl_F.pad_sequence_to_length(
+            attention_mask,
+            max_seq_len=self.config.max_prompt_length,
+            pad_token_id=0,
+            left_pad=False,
+        )
+
+        batch = {
+            "responses": response_ids,
+            "input_ids": idx,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "action": actions,
+        }
+        if proprio is not None:
+            batch["proprio"] = proprio
+        return batch
+
+    def _predict_vla_adapter_token_actions(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        do_sample: bool,
+        temperature: float,
+        unnorm_key: str,
+        pad_token_id: int,
+    ):
+        """
+        Returns:
+          - actions: np.ndarray, shape (B, action_chunks_len, action_token_len)
+          - response_ids: torch.LongTensor, shape (B, action_chunks_len * action_token_len)
+        """
+        from prismatic.vla.constants import (
+            ACTION_PROPRIO_NORMALIZATION_TYPE,
+            ACTION_TOKEN_BEGIN_IDX,
+            IGNORE_INDEX,
+            NormalizationType,
+            NUM_TOKENS,
+            STOP_INDEX,
+        )
+
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+
+        # Prompt length per sample (right-padded inputs)
+        prompt_lens = attention_mask.to(torch.long).sum(dim=-1)
+        max_prompt_len = int(prompt_lens.max().item())
+
+        # Build (prompt + placeholders + stop) and matching labels for action-mask construction in forward()
+        total_len = max_prompt_len + int(NUM_TOKENS) + 1
+        action_input_ids = torch.full((batch_size, total_len), pad_token_id, dtype=input_ids.dtype, device=device)
+        action_attention_mask = torch.zeros((batch_size, total_len), dtype=attention_mask.dtype, device=device)
+        labels = torch.full((batch_size, total_len), IGNORE_INDEX, dtype=torch.long, device=device)
+
+        placeholder_token_id = torch.tensor(1, dtype=input_ids.dtype, device=device)
+        arbitrary_action_token_id = torch.tensor(ACTION_TOKEN_BEGIN_IDX + 1, dtype=torch.long, device=device)
+
+        for i in range(batch_size):
+            plen = int(prompt_lens[i].item())
+            if plen > 0:
+                action_input_ids[i, :plen] = input_ids[i, :plen]
+            action_input_ids[i, plen:plen + int(NUM_TOKENS)] = placeholder_token_id
+            action_input_ids[i, plen + int(NUM_TOKENS)] = STOP_INDEX
+
+            action_attention_mask[i, : plen + int(NUM_TOKENS) + 1] = 1
+
+            labels[i, plen:plen + int(NUM_TOKENS)] = arbitrary_action_token_id
+            labels[i, plen + int(NUM_TOKENS)] = STOP_INDEX
+
+        action_token_count = int(self.config.action_token_len * self.config.action_chunks_len)
+        num_patches = int(self.module.vision_backbone.get_num_patches() * self.module.vision_backbone.get_num_images_in_input())
+        action_vocab_size = int(self.module.action_vocab_size)
+        start_token = action_vocab_size - 256
+
+        response_ids = torch.empty((batch_size, action_token_count), dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            # IMPORTANT: avoid calling Qwen2ForCausalLM.forward() which materializes full (seq, vocab) logits
+            # and casts them to fp32 (very large for vocab~150k). Instead, run the *base* LM (no lm_head),
+            # then project only the last-256 action token rows of lm_head.
+            module = self.module
+            if hasattr(module, "get_base_model"):
+                module = module.get_base_model()
+
+            input_embeddings = module.get_input_embeddings()(action_input_ids)  # (B, seq, D)
+
+            all_actions_mask = module._process_action_masks(labels)
+            language_embeddings = input_embeddings[~all_actions_mask].reshape(
+                input_embeddings.shape[0], -1, input_embeddings.shape[2]
+            )
+
+            projected_patch_embeddings = module._process_vision_features(pixel_values, language_embeddings, use_film=False)
+
+            action_queries = module.action_queries.weight
+            action_queries = action_queries.view(1, action_queries.shape[0], action_queries.shape[1]).repeat(
+                input_embeddings.shape[0], 1, 1
+            )
+            input_embeddings = module._replace_input_embeddings(input_embeddings, all_actions_mask, action_queries)
+
+            multimodal_embeddings, multimodal_attention_mask = module._build_multimodal_attention(
+                input_embeddings, projected_patch_embeddings, action_attention_mask
+            )
+
+            lm = module.language_model
+            lm_outputs = lm.model(
+                input_ids=None,
+                attention_mask=multimodal_attention_mask,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=multimodal_embeddings,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            hidden_states = lm_outputs[0]  # (B, seq_total, hidden)
+
+            # Locate logits that predict the first action token (last prompt position), then next 55 tokens.
+            start_positions = num_patches + prompt_lens.to(torch.long) - 1  # (B,)
+            positions = start_positions[:, None] + torch.arange(action_token_count, device=device)[None, :]
+            action_hidden = hidden_states[torch.arange(batch_size, device=device)[:, None], positions]  # (B, 56, hidden)
+
+            from verl.utils.vla_utils.vla_adapter_token import lm_head_logits_subset
+            action_logits = lm_head_logits_subset(lm.lm_head, action_hidden, start_token, action_vocab_size)  # (B, 56, 256)
+            action_logits = action_logits / temperature
+
+            if do_sample:
+                dist = torch.distributions.Categorical(logits=action_logits)
+                token_offsets = dist.sample()  # (B, 56) in [0, 255]
+            else:
+                token_offsets = torch.argmax(action_logits, dim=-1)
+
+            response_ids[:] = (token_offsets + start_token).to(torch.long)  # (B, 56)
+
+        # Decode to normalized actions via bin_centers (follow model logic exactly).
+        response_ids_np = response_ids.detach().cpu().numpy()
+        discretized_actions = self.module.action_vocab_size - response_ids_np
+        discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.module.bin_centers.shape[0] - 1)
+        normalized_actions = self.module.bin_centers[discretized_actions]
+        normalized_actions = normalized_actions.reshape(batch_size, self.config.action_chunks_len, self.config.action_token_len)
+
+        action_norm_stats = self.module.get_action_stats(unnorm_key)
+        if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
+            mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
+            action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
+        elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:
+            mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+            action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        else:
+            raise ValueError("Unsupported action/proprio normalization type detected!")
+
+        actions = np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low + 1e-8) + action_low,
+            normalized_actions,
+        )
+
+        return actions, response_ids
     
     def _obs_to_input(self, obs, is_robotwin=False, robotwin_version="1.0"):
         """Convert observation to model input format"""

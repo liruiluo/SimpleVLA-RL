@@ -16,6 +16,7 @@ Single Process Actor
 """
 
 import itertools
+import contextlib
 from typing import Iterable, Tuple
 
 import torch
@@ -102,6 +103,156 @@ class RobDataParallelPPOActor(BasePPOActor):
 
         return log_probs_masked, entropy_masked
 
+    def _build_vla_adapter_token_action_inputs(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+        """
+        Build action-prediction inputs for VLA-Adapter token models.
+
+        We keep prompt tokens as a prefix, then insert `NUM_TOKENS` placeholder tokens and a STOP token. We also
+        construct `labels` so that `_process_action_masks(labels)` marks the placeholder positions as action tokens.
+
+        Returns:
+            action_input_ids: (B, L')
+            action_attention_mask: (B, L')
+            labels: (B, L')
+            prompt_lens: (B,)
+        """
+        from prismatic.vla.constants import ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_TOKENS, STOP_INDEX
+
+        if self.pad_token_id is None:
+            raise ValueError("pad_token_id is not set; expected it in data.meta_info['pad_token_id'].")
+
+        device = input_ids.device
+        batch_size = input_ids.size(0)
+
+        # Right-padded => prompt is a prefix.
+        prompt_lens = attention_mask.to(torch.long).sum(dim=-1)
+        max_prompt_len = int(prompt_lens.max().item())
+
+        total_len = max_prompt_len + int(NUM_TOKENS) + 1
+        action_input_ids = torch.full((batch_size, total_len), self.pad_token_id, dtype=input_ids.dtype, device=device)
+        action_attention_mask = torch.zeros((batch_size, total_len), dtype=attention_mask.dtype, device=device)
+        labels = torch.full((batch_size, total_len), IGNORE_INDEX, dtype=torch.long, device=device)
+
+        placeholder_token_id = torch.tensor(1, dtype=input_ids.dtype, device=device)
+        arbitrary_action_token_id = torch.tensor(ACTION_TOKEN_BEGIN_IDX + 1, dtype=torch.long, device=device)
+
+        for i in range(batch_size):
+            plen = int(prompt_lens[i].item())
+            if plen > 0:
+                action_input_ids[i, :plen] = input_ids[i, :plen]
+            action_input_ids[i, plen:plen + int(NUM_TOKENS)] = placeholder_token_id
+            action_input_ids[i, plen + int(NUM_TOKENS)] = STOP_INDEX
+
+            action_attention_mask[i, : plen + int(NUM_TOKENS) + 1] = 1
+
+            labels[i, plen:plen + int(NUM_TOKENS)] = arbitrary_action_token_id
+            labels[i, plen + int(NUM_TOKENS)] = STOP_INDEX
+
+        return action_input_ids, action_attention_mask, labels, prompt_lens
+
+    def _extract_vla_adapter_token_logits(self, full_logits: torch.Tensor, prompt_lens: torch.Tensor, temperature: float):
+        """
+        Extract per-token logits for the (action_chunks_len * action_token_len) action tokens, and restrict to the
+        256-bin action-token vocabulary range.
+
+        Returns:
+            action_logits: (B, action_token_count, 256)
+            start_token: int  # token id base for the 256-bin slice
+        """
+        batch_size = full_logits.size(0)
+        device = full_logits.device
+        action_token_count = int(self.config.action_token_len * self.config.action_chunks_len)
+
+        num_patches = int(self.actor_module.vision_backbone.get_num_patches() * self.actor_module.vision_backbone.get_num_images_in_input())
+        start_positions = num_patches + prompt_lens.to(torch.long) - 1  # (B,)
+        positions = start_positions[:, None] + torch.arange(action_token_count, device=device)[None, :]
+        token_logits = full_logits[torch.arange(batch_size, device=device)[:, None], positions]  # (B, 56, vocab)
+
+        action_vocab_size = int(self.actor_module.action_vocab_size)
+        start_token = action_vocab_size - 256
+        action_logits = token_logits[..., start_token:action_vocab_size]
+
+        if temperature <= 0:
+            temperature = 1.0
+        action_logits = action_logits / float(temperature)
+
+        return action_logits, start_token
+
+    def _forward_vla_adapter_token_action_logits(
+        self,
+        action_input_ids: torch.Tensor,
+        action_attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        labels: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        temperature: float,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Compute action-token logits for VLA-Adapter token models without materializing full-vocab logits.
+
+        Returns:
+            action_logits: (B, action_token_count, 256)
+            start_token: int  # token id base for the 256-bin slice
+        """
+        device = action_input_ids.device
+        batch_size = action_input_ids.size(0)
+        action_token_count = int(self.config.action_token_len * self.config.action_chunks_len)
+
+        module = self.actor_module
+        param_ctx = contextlib.nullcontext()
+        if isinstance(module, FSDP):
+            param_ctx = FSDP.summon_full_params(module, writeback=False, recurse=False)
+
+        with param_ctx:
+            raw = module
+            if isinstance(raw, FSDP):
+                raw = raw._fsdp_wrapped_module
+            if hasattr(raw, "get_base_model"):
+                raw = raw.get_base_model()
+
+            input_embeddings = raw.get_input_embeddings()(action_input_ids)  # (B, seq, D)
+            all_actions_mask = raw._process_action_masks(labels)
+            language_embeddings = input_embeddings[~all_actions_mask].reshape(batch_size, -1, input_embeddings.shape[2])
+
+            projected_patch_embeddings = raw._process_vision_features(pixel_values, language_embeddings, use_film=False)
+
+            action_queries = raw.action_queries.weight
+            action_queries = action_queries.view(1, action_queries.shape[0], action_queries.shape[1]).repeat(batch_size, 1, 1)
+            input_embeddings = raw._replace_input_embeddings(input_embeddings, all_actions_mask, action_queries)
+
+            multimodal_embeddings, multimodal_attention_mask = raw._build_multimodal_attention(
+                input_embeddings, projected_patch_embeddings, action_attention_mask
+            )
+
+            lm = raw.language_model
+            lm_outputs = lm.model(
+                input_ids=None,
+                attention_mask=multimodal_attention_mask,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=multimodal_embeddings,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            hidden_states = lm_outputs[0]  # (B, seq_total, hidden)
+
+            num_patches = int(raw.vision_backbone.get_num_patches() * raw.vision_backbone.get_num_images_in_input())
+            start_positions = num_patches + prompt_lens.to(torch.long) - 1  # (B,)
+            positions = start_positions[:, None] + torch.arange(action_token_count, device=device)[None, :]
+            action_hidden = hidden_states[torch.arange(batch_size, device=device)[:, None], positions]  # (B, 56, hidden)
+
+            action_vocab_size = int(raw.action_vocab_size)
+            start_token = action_vocab_size - 256
+            from verl.utils.vla_utils.vla_adapter_token import lm_head_logits_subset
+            action_logits = lm_head_logits_subset(lm.lm_head, action_hidden, start_token, action_vocab_size)  # (B, 56, 256)
+
+        if temperature <= 0:
+            temperature = 1.0
+        action_logits = action_logits / float(temperature)
+        return action_logits, start_token
+
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         micro_batch:
@@ -124,26 +275,25 @@ class RobDataParallelPPOActor(BasePPOActor):
         response_length = micro_batch['responses'].size(-1) # 7*8
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            input_ids = micro_batch['input_ids']
-            attention_mask = micro_batch['attention_mask']
-            pixel_values = micro_batch["pixel_values"]
-            responses = micro_batch["responses"]
-            
-            input_ids = input_ids.reshape((batch_size * traj_len,) + input_ids.shape[2:])
-            attention_mask = attention_mask.reshape((batch_size * traj_len,) + attention_mask.shape[2:])
-            pixel_values = pixel_values.reshape((batch_size * traj_len,) + pixel_values.shape[2:])
-            responses = responses.reshape((batch_size * traj_len,) + responses.shape[2:])
-            
+            input_ids_3d = micro_batch['input_ids']
+            attention_mask_3d = micro_batch['attention_mask']
+            pixel_values_3d = micro_batch["pixel_values"]
+            responses_3d = micro_batch["responses"]
+
             if self.config.use_proprio:
-                proprio = micro_batch["proprio"]
-                proprio = proprio.reshape((batch_size * traj_len,) + proprio.shape[2:])
+                proprio_3d = micro_batch["proprio"]
             else:
-                proprio = None
-            
-            input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
-            attention_mask_unpad, _ = self.process_tensor(attention_mask, 0)
-            
+                proprio_3d = None
+
             if self.config.vla == "openvla-oft":
+                input_ids = input_ids_3d.reshape((batch_size * traj_len,) + input_ids_3d.shape[2:])
+                attention_mask = attention_mask_3d.reshape((batch_size * traj_len,) + attention_mask_3d.shape[2:])
+                pixel_values = pixel_values_3d.reshape((batch_size * traj_len,) + pixel_values_3d.shape[2:])
+                responses = responses_3d.reshape((batch_size * traj_len,) + responses_3d.shape[2:])
+                proprio = proprio_3d.reshape((batch_size * traj_len,) + proprio_3d.shape[2:]) if proprio_3d is not None else None
+
+                input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
+                attention_mask_unpad, _ = self.process_tensor(attention_mask, 0)
                 logits = self.actor_module(input_ids=input_ids_unpad,
                                         attention_mask=attention_mask_unpad,
                                         pixel_values=pixel_values,
@@ -172,6 +322,13 @@ class RobDataParallelPPOActor(BasePPOActor):
                 entropy = entropy.reshape((batch_size, traj_len*response_length)) 
                 
             elif self.config.vla == "openvla":
+                input_ids = input_ids_3d.reshape((batch_size * traj_len,) + input_ids_3d.shape[2:])
+                attention_mask = attention_mask_3d.reshape((batch_size * traj_len,) + attention_mask_3d.shape[2:])
+                pixel_values = pixel_values_3d.reshape((batch_size * traj_len,) + pixel_values_3d.shape[2:])
+                responses = responses_3d.reshape((batch_size * traj_len,) + responses_3d.shape[2:])
+
+                input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
+                attention_mask_unpad, _ = self.process_tensor(attention_mask, 0)
                 output = self.actor_module(input_ids=input_ids_unpad,
                                     attention_mask=attention_mask_unpad,
                                     pixel_values=pixel_values,
@@ -196,6 +353,53 @@ class RobDataParallelPPOActor(BasePPOActor):
                 entropy = entropy.reshape((batch_size, traj_len*response_length))
                 
                 
+            elif self.config.vla == "vla-adapter-token":
+                # VLA-Adapter token models have very large vocab (Qwen); avoid flattening all traj steps at once.
+                # Chunk over trajectory dimension to prevent allocating (B*T, seq, vocab) logits tensors.
+                traj_chunk = int(getattr(self.config, "traj_mini_batch_size", 1) or 1)
+                traj_chunk = max(1, min(traj_len, traj_chunk))
+
+                log_probs_parts = []
+                entropy_parts = []
+                for t0 in range(0, traj_len, traj_chunk):
+                    t1 = min(traj_len, t0 + traj_chunk)
+                    chunk_len = t1 - t0
+
+                    input_ids = input_ids_3d[:, t0:t1, :].reshape((batch_size * chunk_len,) + input_ids_3d.shape[2:])
+                    attention_mask = attention_mask_3d[:, t0:t1, :].reshape((batch_size * chunk_len,) + attention_mask_3d.shape[2:])
+                    pixel_values = pixel_values_3d[:, t0:t1, ...].reshape((batch_size * chunk_len,) + pixel_values_3d.shape[2:])
+                    responses = responses_3d[:, t0:t1, :].reshape((batch_size * chunk_len,) + responses_3d.shape[2:])
+
+                    action_input_ids, action_attention_mask, labels, prompt_lens = self._build_vla_adapter_token_action_inputs(
+                        input_ids=input_ids, attention_mask=attention_mask
+                    )
+                    action_logits, start_token = self._forward_vla_adapter_token_action_logits(
+                        action_input_ids=action_input_ids,
+                        action_attention_mask=action_attention_mask,
+                        pixel_values=pixel_values,
+                        labels=labels,
+                        prompt_lens=prompt_lens,
+                        temperature=temperature,
+                    )
+                    token_offsets = (responses.to(torch.long) - start_token).clamp(min=0, max=255)
+                    chunk_log_probs = logprobs_from_logits(action_logits, token_offsets)  # (B*chunk, 56)
+                    chunk_entropy = verl_F.entropy_from_logits(action_logits)  # (B*chunk, 56)
+
+                    chunk_log_probs = chunk_log_probs.reshape(batch_size, chunk_len, -1)
+                    chunk_entropy = chunk_entropy.reshape(batch_size, chunk_len, -1)
+                    log_probs_parts.append(chunk_log_probs)
+                    entropy_parts.append(chunk_entropy)
+
+                log_probs = torch.cat(log_probs_parts, dim=1)  # (B, traj_len, 56)
+                entropy = torch.cat(entropy_parts, dim=1)  # (B, traj_len, 56)
+
+                log_probs = log_probs.reshape((batch_size, traj_len * self.config.action_chunks_len, self.config.action_token_len))
+                entropy = entropy.reshape((batch_size, traj_len * self.config.action_chunks_len, self.config.action_token_len))
+                mask = self.generate_traj_mask(micro_batch['finish_step'], traj_len*self.config.action_chunks_len)
+                log_probs, entropy = self.apply_mask_with_grad_control(log_probs, entropy, mask)
+
+                log_probs = log_probs.reshape((batch_size, traj_len*response_length))
+                entropy = entropy.reshape((batch_size, traj_len*response_length))
 
             return entropy, log_probs
     
@@ -254,6 +458,42 @@ class RobDataParallelPPOActor(BasePPOActor):
                 entropy = entropy.reshape((1, -1))
 
                 return entropy, log_probs
+            
+            elif self.config.vla == "vla-adapter-token":
+                # Chunk to avoid OOM when (N, seq, vocab) becomes too large.
+                n = input_ids.size(0)
+                traj_chunk = int(getattr(self.config, "traj_mini_batch_size", 1) or 1)
+                traj_chunk = max(1, min(n, traj_chunk))
+
+                log_probs_parts = []
+                entropy_parts = []
+                for s0 in range(0, n, traj_chunk):
+                    s1 = min(n, s0 + traj_chunk)
+                    ids = input_ids[s0:s1]
+                    mask = attention_mask[s0:s1]
+                    pix = pixel_values[s0:s1]
+                    resp = responses[s0:s1]
+
+                    action_input_ids, action_attention_mask, labels, prompt_lens = self._build_vla_adapter_token_action_inputs(
+                        input_ids=ids, attention_mask=mask
+                    )
+                    action_logits, start_token = self._forward_vla_adapter_token_action_logits(
+                        action_input_ids=action_input_ids,
+                        action_attention_mask=action_attention_mask,
+                        pixel_values=pix,
+                        labels=labels,
+                        prompt_lens=prompt_lens,
+                        temperature=temperature,
+                    )
+                    token_offsets = (resp.to(torch.long) - start_token).clamp(min=0, max=255)
+                    chunk_log_probs = logprobs_from_logits(action_logits, token_offsets)  # (chunk, 56)
+                    chunk_entropy = verl_F.entropy_from_logits(action_logits)  # (chunk, 56)
+                    log_probs_parts.append(chunk_log_probs)
+                    entropy_parts.append(chunk_entropy)
+
+                log_probs = torch.cat(log_probs_parts, dim=0).reshape((1, -1))
+                entropy = torch.cat(entropy_parts, dim=0).reshape((1, -1))
+                return entropy, log_probs
                 
 
     def _forward_micro_batch_entropy(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -287,10 +527,9 @@ class RobDataParallelPPOActor(BasePPOActor):
             else:
                 proprio = None
             
-            input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
-            attention_mask_unpad, _ = self.process_tensor(attention_mask, 0)
-
             if  self.config.vla == "openvla-oft":
+                input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
+                attention_mask_unpad, _ = self.process_tensor(attention_mask, 0)
             
                 logits = self.actor_module(input_ids=input_ids_unpad,
                                                 attention_mask=attention_mask_unpad,
@@ -314,6 +553,8 @@ class RobDataParallelPPOActor(BasePPOActor):
                 return entropy
             
             elif self.config.vla == "openvla":
+                input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
+                attention_mask_unpad, _ = self.process_tensor(attention_mask, 0)
                 output = self.actor_module(input_ids=input_ids_unpad,
                                         attention_mask=attention_mask_unpad,
                                         pixel_values=pixel_values,
@@ -330,6 +571,41 @@ class RobDataParallelPPOActor(BasePPOActor):
 
                 entropy = entropy.reshape((batch_size, traj_len,) + entropy.shape[1:])
                 mask = self.generate_traj_mask(micro_batch['finish_step'], traj_len)
+                _, entropy = self.apply_mask_with_grad_control(entropy, entropy, mask)
+                entropy = entropy.reshape((batch_size, traj_len*response_length))
+                return entropy
+            
+            elif self.config.vla == "vla-adapter-token":
+                traj_chunk = int(getattr(self.config, "traj_mini_batch_size", 1) or 1)
+                traj_chunk = max(1, min(traj_len, traj_chunk))
+
+                entropy_parts = []
+                for t0 in range(0, traj_len, traj_chunk):
+                    t1 = min(traj_len, t0 + traj_chunk)
+                    chunk_len = t1 - t0
+
+                    input_ids = micro_batch['input_ids'][:, t0:t1, :].reshape((batch_size * chunk_len,) + micro_batch['input_ids'].shape[2:])
+                    attention_mask = micro_batch['attention_mask'][:, t0:t1, :].reshape((batch_size * chunk_len,) + micro_batch['attention_mask'].shape[2:])
+                    pixel_values = micro_batch["pixel_values"][:, t0:t1, ...].reshape((batch_size * chunk_len,) + micro_batch["pixel_values"].shape[2:])
+
+                    action_input_ids, action_attention_mask, labels, prompt_lens = self._build_vla_adapter_token_action_inputs(
+                        input_ids=input_ids, attention_mask=attention_mask
+                    )
+                    action_logits, _ = self._forward_vla_adapter_token_action_logits(
+                        action_input_ids=action_input_ids,
+                        action_attention_mask=action_attention_mask,
+                        pixel_values=pixel_values,
+                        labels=labels,
+                        prompt_lens=prompt_lens,
+                        temperature=temperature,
+                    )
+                    chunk_entropy = verl_F.entropy_from_logits(action_logits)  # (B*chunk, 56)
+                    chunk_entropy = chunk_entropy.reshape(batch_size, chunk_len, -1)
+                    entropy_parts.append(chunk_entropy)
+
+                entropy = torch.cat(entropy_parts, dim=1)  # (B, traj_len, 56)
+                entropy = entropy.reshape((batch_size, traj_len * self.config.action_chunks_len, self.config.action_token_len))
+                mask = self.generate_traj_mask(micro_batch['finish_step'], traj_len*self.config.action_chunks_len)
                 _, entropy = self.apply_mask_with_grad_control(entropy, entropy, mask)
                 entropy = entropy.reshape((batch_size, traj_len*response_length))
                 return entropy
@@ -404,6 +680,7 @@ class RobDataParallelPPOActor(BasePPOActor):
         assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size == 0
         self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+        self.pad_token_id = data.meta_info.get('pad_token_id', getattr(self, 'pad_token_id', None))
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', 'old_log_probs', 'advantages',"finish_step"]
         if self.config.use_proprio:

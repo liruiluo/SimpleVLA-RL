@@ -29,6 +29,7 @@ actor_rollout_ref:
     action_chunks_len: 8
     resume: False
     path: ~/models/deepseek-llm-7b-chat
+    vla_adapter_repo_path: null
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: False
@@ -84,6 +85,8 @@ actor_rollout_ref:
   rollout:
     vla: ${actor_rollout_ref.model.vla}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
+    action_token_len: ${actor_rollout_ref.model.action_token_len}
+    use_minivlm: False  # Qwen/chat-style prompting for token-VLA (vla-adapter-token)
     experiment_name: None
     unnorm_key: libero_10
     twin2_task_config: demo_randomized
@@ -241,6 +244,7 @@ algorithm:
 trainer:
   total_epochs: 30
   total_training_steps: null
+  total_steps: null  # Stop after N RL updates (global_steps); overrides total_epochs if set.
   project_name: verl_examples
   experiment_name: gsm8k
   logger: ['console', 'wandb']
@@ -254,4 +258,5 @@ trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   runtime_env: none
   val_before_train: False
+  max_val_batches: null  # set to an int to limit validation batches (useful for robotics rollouts)
   val_only: True

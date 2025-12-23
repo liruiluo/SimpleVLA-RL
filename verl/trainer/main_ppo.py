@@ -106,12 +106,23 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
+        runtime_env = None
         if os.path.isfile(str(config.trainer.runtime_env)):
             with open(str(config.trainer.runtime_env), 'r') as f:
                 runtime_env = json.load(f)
-            ray.init(runtime_env=runtime_env)
         else:
-            ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+            runtime_env = {'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}}
+
+        init_kwargs = {}
+        # Reduce driver overhead for local single-node runs (dashboard consumes memory and spawns extra processes).
+        if os.environ.get("VERL_RAY_DISABLE_DASHBOARD", "1") == "1":
+            init_kwargs["include_dashboard"] = False
+
+        obj_store_gb = os.environ.get("VERL_RAY_OBJECT_STORE_MEMORY_GB", "").strip()
+        if obj_store_gb:
+            init_kwargs["object_store_memory"] = int(float(obj_store_gb) * (1024**3))
+
+        ray.init(runtime_env=runtime_env, **init_kwargs)
 
     ray.get(main_task.remote(config))
 

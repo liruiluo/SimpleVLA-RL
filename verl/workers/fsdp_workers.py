@@ -18,6 +18,8 @@ The main entry point to run the PPO algorithm
 import os
 import logging
 import warnings
+import math
+import time
 import ray
 import torch
 import torch.distributed
@@ -59,6 +61,21 @@ def convert_to_regular_types(obj):
     elif isinstance(obj, dict):
         return {k: convert_to_regular_types(v) for k, v in obj.items()}
     return obj
+
+def find_peft_adapter_dir(checkpoint_dir: str) -> str | None:
+    """
+    Try to locate a PEFT adapter directory (contains adapter_config.json) under a checkpoint.
+
+    VLA-Adapter checkpoints save adapters in `lora_adapter/` by default.
+    """
+    candidates = [
+        os.path.join(checkpoint_dir, "lora_adapter"),
+        checkpoint_dir,
+    ]
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "adapter_config.json")):
+            return c
+    return None
 
 
 class RobActorRolloutRefWorker(Worker):
@@ -126,6 +143,18 @@ class RobActorRolloutRefWorker(Worker):
         local_path = copy_local_path_from_hdfs(model_path)
         #add oft
          
+        if self.config.model.vla == "vla-adapter-token":
+            from verl.utils.vla_utils.vla_adapter_token import (
+                ensure_hf_trust_remote_code_safe_path,
+                ensure_vla_adapter_prismatic,
+            )
+
+            vla_adapter_repo_path = None
+            if hasattr(self.config.model, "get"):
+                vla_adapter_repo_path = self.config.model.get("vla_adapter_repo_path", None)
+            local_path = ensure_hf_trust_remote_code_safe_path(local_path)
+            ensure_vla_adapter_prismatic(vla_adapter_repo_path=vla_adapter_repo_path, hint_path=local_path)
+
         if self.config.model.vla == "openvla-oft":
             from verl.utils.vla_utils.openvla_oft.configuration_prismatic import OpenVLAConfig
             from verl.utils.vla_utils.openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
@@ -152,6 +181,9 @@ class RobActorRolloutRefWorker(Worker):
                 update_auto_map(local_path)
                 check_model_logic_mismatch(local_path)
             torch.distributed.barrier()
+        elif self.config.model.vla == "vla-adapter-token":
+            # Rely on checkpoint-local `auto_map` + `trust_remote_code=True` (do NOT register repo-local OpenVLA classes).
+            pass
         
         #add end
 
@@ -164,6 +196,10 @@ class RobActorRolloutRefWorker(Worker):
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        # For LoRA fine-tuning, the base weights are frozen; loading actor weights in fp32 on a single GPU can
+        # easily OOM for large token-VLA backbones (e.g., Qwen). Prefer bf16 storage in that case.
+        if self._is_actor and self._is_lora and torch_dtype == torch.float32:
+            torch_dtype = torch.bfloat16
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
@@ -171,10 +207,11 @@ class RobActorRolloutRefWorker(Worker):
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(actor_model_config.model_type)
         override_config_kwargs = {
-            'bos_token_id': self.tokenizer.bos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
             'pad_token_id': self.tokenizer.pad_token_id,
         }
+        if self.tokenizer.bos_token_id is not None:
+            override_config_kwargs['bos_token_id'] = self.tokenizer.bos_token_id
         if self.config.rollout.use_proprio:
             override_config_kwargs["use_proprio"] = True
             override_config_kwargs["proprio_dim"] = self.config.model.action_token_len
@@ -226,6 +263,28 @@ class RobActorRolloutRefWorker(Worker):
                                                     config=actor_model_config,              
                                                     trust_remote_code=True,
                                                 )
+            elif self.config.model.vla == "vla-adapter-token":
+                actor_module = AutoModelForVision2Seq.from_pretrained(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    attn_implementation="flash_attention_2",
+                    config=actor_model_config,
+                    trust_remote_code=True,
+                )
+                if hasattr(actor_module, "vision_backbone") and hasattr(actor_module.vision_backbone, "set_num_images_in_input"):
+                    actor_module.vision_backbone.set_num_images_in_input(self.config.actor.num_images_in_input)
+
+                dataset_statistics_path = os.path.join(local_path, "dataset_statistics.json")
+                if os.path.isfile(dataset_statistics_path):
+                    with open(dataset_statistics_path, "r") as f:
+                        norm_stats = json.load(f)
+                    actor_module.norm_stats = norm_stats
+                else:
+                    print(
+                        "WARNING: No local dataset_statistics.json file found for current checkpoint.\n"
+                        "You can ignore this if you are loading the base VLA (i.e. not fine-tuned) checkpoint."
+                        "Otherwise, you may run into errors when trying to call `predict_action()` due to an absent `unnorm_key`."
+                    )
            
             actor_module.to(torch_dtype)
 
@@ -233,18 +292,44 @@ class RobActorRolloutRefWorker(Worker):
                 actor_module.gradient_checkpointing_enable()
             # lora add
             if self._is_lora:
-                print("Applying LoRA to actor module")
-                
-                lora_config = {
-                    #'task_type': TaskType.CAUSAL_LM,
-                    'r': self.config.model.lora_rank,
-                    'lora_alpha': self.config.model.lora_alpha,
-                    "lora_dropout": 0 ,
-                    'target_modules': convert_to_regular_types(self.config.model.target_modules),
-                    'init_lora_weights': "gaussian"
-                }
-                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))  
-                actor_module.print_trainable_parameters()
+                lora_load_from_checkpoint = True
+                if hasattr(self.config.model, "get"):
+                    lora_load_from_checkpoint = bool(self.config.model.get("lora_load_from_checkpoint", True))
+
+                # Actor has optimizer; rollout/ref don't.
+                lora_is_trainable = optim_config is not None
+
+                adapter_dir = None
+                if lora_load_from_checkpoint:
+                    adapter_dir = find_peft_adapter_dir(local_path)
+                    if adapter_dir is None:
+                        raise FileNotFoundError(
+                            "LoRA is enabled but no adapter was found in the checkpoint. "
+                            "Expected `adapter_config.json` in either:\n"
+                            f"  - {os.path.join(local_path, 'lora_adapter')}\n"
+                            f"  - {local_path}\n"
+                            "If you want to train a fresh adapter, set `model.lora_load_from_checkpoint=False`."
+                        )
+
+                    print(f"Loading LoRA adapter from checkpoint: {adapter_dir} (trainable={lora_is_trainable})")
+                    actor_module = PeftModel.from_pretrained(actor_module, adapter_dir, is_trainable=lora_is_trainable)
+                    if lora_is_trainable:
+                        actor_module.print_trainable_parameters()
+                    else:
+                        actor_module.requires_grad_(False)
+                else:
+                    print("Applying fresh LoRA to actor module")
+                    lora_config = {
+                        'r': self.config.model.lora_rank,
+                        'lora_alpha': self.config.model.lora_alpha,
+                        "lora_dropout": 0,
+                        'target_modules': convert_to_regular_types(self.config.model.target_modules),
+                        'init_lora_weights': "gaussian",
+                    }
+                    actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                    actor_module.print_trainable_parameters()
+
+                actor_module.to(torch_dtype)
             # lora end
                 
                 
@@ -503,16 +588,63 @@ class RobActorRolloutRefWorker(Worker):
         with self.sharding_manager:
             log_gpu_memory_usage('After entering sharding manager', logger=logger)    
             prompts = self.sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
-            log_gpu_memory_usage('After rollout generation', logger=logger)
+            # Token-VLA (Qwen) trajectories are large; concatenating all rollout outputs on GPU can OOM.
+            # Stream micro-batches: generate -> (optional) recompute old_log_probs -> move to CPU -> concat on CPU.
+            if self.config.model.vla == "vla-adapter-token":
+                batch_size = prompts.batch.batch_size[0]
+                if prompts.meta_info.get('n_samples') is None:
+                    micro_batch_size = self.config.rollout.val_micro_batch_size if self.config.rollout.val_micro_batch_size is not None else 1
+                else:
+                    micro_batch_size = int(self.config.rollout.get('micro_batch_size', batch_size))
+                micro_batch_size = max(1, min(int(micro_batch_size), int(batch_size)))
+                num_chunks = int(math.ceil(batch_size / micro_batch_size))
+                batch_prompts = prompts.chunk(chunks=num_chunks)
 
-            output = self.sharding_manager.postprocess_data(output)
-            torch.cuda.synchronize()
+                outputs = []
+                show_progress = os.environ.get("VERL_ROLLOUT_PROGRESS", "1") == "1"
+                for i, p in enumerate(batch_prompts):
+                    if show_progress:
+                        print(
+                            f"[rollout] chunk {i + 1}/{len(batch_prompts)} start "
+                            f"(batch={int(p.batch.batch_size[0])}, n_samples={p.meta_info.get('n_samples')})",
+                            flush=True,
+                        )
+                    t0 = time.time()
+                    out = self.rollout.generate_sequences(prompts=p)
+                    out = self.sharding_manager.postprocess_data(out)
+                    torch.cuda.synchronize()
+                    if show_progress:
+                        print(
+                            f"[rollout] chunk {i + 1}/{len(batch_prompts)} done in {time.time() - t0:.1f}s",
+                            flush=True,
+                        )
+
+                    if self._is_actor and recompute_log_prob:
+                        out.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
+                        out.meta_info['temperature'] = self.config.rollout.temperature
+                        out.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
+                        out.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
+                        out.meta_info['pad_token_id'] = self.tokenizer.pad_token_id
+                        old_log_probs = self.actor.compute_log_prob(data=out)
+                        out.batch['old_log_probs'] = old_log_probs
+
+                    outputs.append(out.to('cpu'))
+                    # Free intermediate GPU buffers between chunks.
+                    torch.cuda.empty_cache()
+
+                output = DataProto.concat(outputs)
+                log_gpu_memory_usage('After rollout generation (streamed)', logger=logger)
+            else:
+                output = self.rollout.generate_sequences(prompts=prompts)
+                log_gpu_memory_usage('After rollout generation', logger=logger)
+
+                output = self.sharding_manager.postprocess_data(output)
+                torch.cuda.synchronize()
 
         # with Timer(name=f'gen seq end ,  old log will begin', text="{name}: {seconds:.1f} seconds") as timer:    
         #     print("gen seq end ,  old log will begin")
         
-        if self._is_actor and recompute_log_prob:
+        if self.config.model.vla != "vla-adapter-token" and self._is_actor and recompute_log_prob:
             # we should always recompute old_log_probs when it is HybridEngine
             
             output.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
@@ -723,10 +855,11 @@ class ActorRolloutRefWorker(Worker):
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(actor_model_config.model_type)
         override_config_kwargs = {
-            'bos_token_id': self.tokenizer.bos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
             'pad_token_id': self.tokenizer.pad_token_id,
         }
+        if self.tokenizer.bos_token_id is not None:
+            override_config_kwargs['bos_token_id'] = self.tokenizer.bos_token_id
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
@@ -1125,10 +1258,11 @@ class CriticWorker(Worker):
         from omegaconf import OmegaConf
         override_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
         override_config_kwargs = {
-            'bos_token_id': self.tokenizer.bos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
             'pad_token_id': self.tokenizer.pad_token_id,
         }
+        if self.tokenizer.bos_token_id is not None:
+            override_config_kwargs['bos_token_id'] = self.tokenizer.bos_token_id
         override_config_kwargs.update(override_config)
         if self.rank == 0:
             print(f'Critic overriding config {override_config_kwargs}')

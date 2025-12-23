@@ -337,7 +337,13 @@ class RayTrainer(object):
         reward_tensor_lst = []
         data_source_lst = []
         metric_dict = {}
-        for test_data in self.val_dataloader:
+        max_val_batches = self.config.trainer.get("max_val_batches", None)
+        if max_val_batches is not None:
+            max_val_batches = int(max_val_batches)
+            if max_val_batches <= 0:
+                return {}
+
+        for batch_idx, test_data in enumerate(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
            
             test_batch.meta_info = {
@@ -371,6 +377,9 @@ class RayTrainer(object):
             #data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
             #data_source_lst.append( [self.config.data.task_suite_name] * reward_tensor.shape[0])
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', [self.config.data.task_suite_name] * reward_tensor.shape[0]))
+
+            if max_val_batches is not None and (batch_idx + 1) >= max_val_batches:
+                break
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
@@ -481,6 +490,11 @@ class RayTrainer(object):
                           config=OmegaConf.to_container(self.config, resolve=True))
 
         global_steps = 0
+        target_steps = self.config.trainer.get('total_steps', None)
+        if target_steps is not None:
+            target_steps = int(target_steps)
+            if target_steps <= 0:
+                target_steps = None
         dp_size = self.actor_rollout_wg.world_size // self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
         batch_size = self.config.data.train_batch_size
         n_samples = self.config.data.n_samples
@@ -495,6 +509,7 @@ class RayTrainer(object):
             if self.config.trainer.get('val_only', False):
                 return
 
+        stop_training = False
         for epoch in range(self.config.trainer.total_epochs):
             self.train_dataloader.start_new_epoch()
             while True:
@@ -662,6 +677,7 @@ class RayTrainer(object):
                     with Timer(name='update_actor', text="{name}: {seconds:.1f} seconds") as timer:
                         batch.meta_info['is_filtered'] = True
                         batch.meta_info['train_mode'] = False
+                        batch.meta_info['pad_token_id'] = self.tokenizer.pad_token_id
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                         entropy_output = self.actor_rollout_wg.compute_entropy(data=batch)
                     metrics['timing/update_actor'] = timer.last
@@ -708,6 +724,12 @@ class RayTrainer(object):
                         self.rm_wg.save_checkpoint(prm_local_path, prm_remote_path)
 
                 global_steps += 1
+                if target_steps is not None and global_steps >= target_steps:
+                    stop_training = True
+                    break
+
+            if stop_training:
+                break
 
         # perform validation after training
         if self.val_reward_fn is not None:

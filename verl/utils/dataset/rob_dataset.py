@@ -29,11 +29,44 @@ from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 import json
+import sys
 
-try:
-    from libero.libero import benchmark
-except ImportError as e:
-    print(f"Warning : can't import libero: {e}")
+benchmark = None
+
+def ensure_libero_importable() -> None:
+    """
+    Ensure `import libero` works.
+
+    We avoid adding VLA-Adapter/LIBERO as a hard dependency by optionally using:
+      - env var `VLA_ADAPTER_REPO_PATH` (preferred)
+    """
+    global benchmark
+    if benchmark is not None:
+        return
+
+    try:
+        from libero.libero import benchmark as _benchmark
+        benchmark = _benchmark
+        return
+    except ImportError as e:
+        vla_adapter_repo_path = os.environ.get("VLA_ADAPTER_REPO_PATH", "").strip()
+        if not vla_adapter_repo_path:
+            raise ImportError(
+                "`libero` is not installed and `VLA_ADAPTER_REPO_PATH` is not set. "
+                "Please export `VLA_ADAPTER_REPO_PATH=/path/to/VLA-Adapter`."
+            ) from e
+
+        libero_root = os.path.join(vla_adapter_repo_path, "LIBERO")
+        if not os.path.isdir(libero_root):
+            raise ImportError(
+                f"`VLA_ADAPTER_REPO_PATH` does not contain `LIBERO/`: {libero_root}"
+            ) from e
+
+        if libero_root not in sys.path:
+            sys.path.insert(0, libero_root)
+
+        from libero.libero import benchmark as _benchmark  # noqa: F401
+        benchmark = _benchmark
     
 def collate_fn(data_list: list[dict]) -> dict:
     tensors = {}
@@ -75,8 +108,20 @@ class LIBERO_Dataset(Dataset):
         self._read_files_and_tokenize()
 
     def _read_files_and_tokenize(self):
-        benchmark_dict = benchmark.get_benchmark_dict()
-        task_suite = benchmark_dict[self.task_suite_name]()
+        from verl.utils.stdout_filter import filter_std_streams
+
+        ensure_libero_importable()
+
+        noisy_substrings = (
+            "[Warning]: datasets path ",
+            "[info] using task orders ",
+            "datasets path ",
+            "using task orders ",
+        )
+
+        with filter_std_streams(noisy_substrings):
+            benchmark_dict = benchmark.get_benchmark_dict()
+            task_suite = benchmark_dict[self.task_suite_name]()
         num_tasks_in_suite = task_suite.n_tasks
         dataframes = []
         

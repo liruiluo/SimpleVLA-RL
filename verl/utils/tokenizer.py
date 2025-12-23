@@ -71,6 +71,14 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
         processor = AutoProcessor.from_pretrained(name_or_path, trust_remote_code=True)
         tokenizer=processor.tokenizer
+    elif model == "vla-adapter-token":
+        # Use checkpoint-local AutoProcessor (trust_remote_code=True) to get the exact tokenizer used by VLA-Adapter.
+        from transformers import AutoProcessor
+        from verl.utils.vla_utils.vla_adapter_token import ensure_hf_trust_remote_code_safe_path
+        print("*********USE VLA-Adapter tokenizer*************")
+        name_or_path = ensure_hf_trust_remote_code_safe_path(name_or_path)
+        processor = AutoProcessor.from_pretrained(name_or_path, trust_remote_code=True)
+        tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
         
