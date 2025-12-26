@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 
 def ensure_vla_adapter_prismatic(vla_adapter_repo_path: Optional[str] = None, hint_path: Optional[str] = None) -> str:
@@ -93,39 +94,71 @@ def lm_head_logits_subset(lm_head: torch.nn.Module, hidden_states: torch.Tensor,
     Returns:
         logits: (..., end_token-start_token) in fp32.
     """
-    if hasattr(lm_head, "base_layer"):
-        base_layer = lm_head.base_layer
-    else:
-        base_layer = lm_head
+    # Match PEFT's LoRA Linear.forward numerics as closely as possible by using F.linear
+    # (so dtype / rounding match the underlying kernels), then cast to fp32 at the end.
+    base_layer = lm_head.base_layer if hasattr(lm_head, "base_layer") else lm_head
 
-    weight = base_layer.weight[start_token:end_token]
-    logits = torch.matmul(hidden_states, weight.t()).to(torch.float32)
+    weight_slice = base_layer.weight[start_token:end_token]
     bias = getattr(base_layer, "bias", None)
-    if bias is not None:
-        logits = logits + bias[start_token:end_token].to(torch.float32)
+    bias_slice = bias[start_token:end_token] if bias is not None else None
 
-    # PEFT LoRA: delta = (x @ A^T) @ B^T * scaling
-    if hasattr(lm_head, "lora_A") and hasattr(lm_head, "lora_B") and len(getattr(lm_head, "lora_A", {})) > 0:
-        name = None
-        active = getattr(lm_head, "active_adapters", None)
-        if isinstance(active, (list, tuple, set)) and len(active) > 0:
-            name = next(iter(active))
-        elif isinstance(active, str) and active:
-            name = active
-        else:
-            active = getattr(lm_head, "active_adapter", None)
-            if isinstance(active, str) and active:
-                name = active
-            else:
-                name = next(iter(lm_head.lora_A.keys()))
+    # Base projection (same dtype as base_layer forward).
+    result = F.linear(hidden_states, weight_slice, bias_slice)
+    torch_result_dtype = result.dtype
 
-        A = lm_head.lora_A[name].weight  # (r, hidden)
-        B = lm_head.lora_B[name].weight  # (vocab, r)
-        scaling = float(getattr(lm_head, "scaling", {}).get(name, 1.0))
+    # PEFT LoRA (peft==0.11.1): result += lora_B(lora_A(dropout(x))) * scaling for each active adapter.
+    # If adapters are disabled or merged, base_layer already contains the effective weights.
+    if hasattr(lm_head, "disable_adapters") and (getattr(lm_head, "disable_adapters") or getattr(lm_head, "merged", False)):
+        return result.to(torch.float32)
 
-        x_a = torch.matmul(hidden_states.to(A.dtype), A.t())  # (..., r)
-        B_slice = B[start_token:end_token]  # (slice, r)
-        delta = torch.matmul(x_a.to(B_slice.dtype), B_slice.t()) * scaling
-        logits = logits + delta.to(torch.float32)
+    def _get(obj, key, default=None):
+        if obj is None:
+            return default
+        if hasattr(obj, "get"):
+            return obj.get(key, default)
+        if hasattr(obj, "__contains__") and key in obj:
+            return obj[key]
+        return default
 
-    return logits
+    lora_A = getattr(lm_head, "lora_A", None)
+    lora_B = getattr(lm_head, "lora_B", None)
+    # PEFT stores adapters in nn.ModuleDict (dict-like but not an actual `dict` / Mapping).
+    if lora_A is not None and lora_B is not None and hasattr(lora_A, "keys") and hasattr(lora_B, "keys") and len(lora_A) > 0:
+        active_adapters = getattr(lm_head, "active_adapters", None)
+        if isinstance(active_adapters, str):
+            active_adapters = [active_adapters]
+        if not isinstance(active_adapters, (list, tuple, set)):
+            active_adapters = list(lora_A.keys())
+
+        scaling_map = getattr(lm_head, "scaling", None)
+        dropout_map = getattr(lm_head, "lora_dropout", None)
+        use_dora_map = getattr(lm_head, "use_dora", None)
+
+        for name in active_adapters:
+            if name not in lora_A or name not in lora_B:
+                continue
+            if bool(_get(use_dora_map, name, False)):
+                raise NotImplementedError("DoRA is not supported in lm_head_logits_subset")
+
+            A_mod = lora_A[name]  # Linear(in_features=hidden, out_features=r)
+            B_mod = lora_B[name]  # Linear(in_features=r, out_features=vocab)
+            dropout = _get(dropout_map, name, None)
+            scaling = float(_get(scaling_map, name, 1.0))
+
+            x = hidden_states.to(A_mod.weight.dtype)
+            if dropout is not None:
+                x = dropout(x)
+            # lora_A(dropout(x)) using module forward (matches PEFT)
+            x_a = A_mod(x)
+
+            # lora_B(...) but only for the vocab slice
+            B_weight = B_mod.weight[start_token:end_token]
+            delta = F.linear(x_a, B_weight, None)
+
+            # Multiply in-module dtype (PEFT uses python float scaling, which follows tensor dtype).
+            delta = delta * delta.new_tensor(scaling)
+            result = result + delta
+
+        result = result.to(torch_result_dtype)
+
+    return result.to(torch.float32)

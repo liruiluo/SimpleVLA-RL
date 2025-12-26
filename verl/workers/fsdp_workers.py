@@ -324,10 +324,14 @@ class RobActorRolloutRefWorker(Worker):
                         'lora_alpha': self.config.model.lora_alpha,
                         "lora_dropout": 0,
                         'target_modules': convert_to_regular_types(self.config.model.target_modules),
-                        'init_lora_weights': "gaussian",
+                        # Keep initial delta ~0 so the policy behavior matches the loaded checkpoint before RL updates.
+                        'init_lora_weights': True,
                     }
                     actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
-                    actor_module.print_trainable_parameters()
+                    if lora_is_trainable:
+                        actor_module.print_trainable_parameters()
+                    else:
+                        actor_module.requires_grad_(False)
 
                 actor_module.to(torch_dtype)
             # lora end

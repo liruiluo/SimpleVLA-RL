@@ -166,6 +166,11 @@ if [ -z "${EXPERIMENT_NAME:-}" ] && [ -n "${DATASET_NAME:-}" ]; then
 fi
 
 NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-1}"
+# For the default 1-img Qwen token-VLA checkpoint we ship here, the LoRA adapter is already merged into
+# `model.safetensors` (VLA-Adapter eval loads it as a plain HF model). Loading `lora_adapter/` again would
+# double-apply LoRA and severely hurt success rate.
+LORA_LOAD_FROM_CHECKPOINT="${LORA_LOAD_FROM_CHECKPOINT:-0}"
+export LORA_LOAD_FROM_CHECKPOINT
 
 bash "${REPO_ROOT}/examples/run_vla_adapter_token_rl_libero_lora.sh" \
   actor_rollout_ref.actor.num_images_in_input="${NUM_IMAGES_IN_INPUT}" \

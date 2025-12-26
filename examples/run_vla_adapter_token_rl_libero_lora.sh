@@ -83,6 +83,11 @@ export VLA_ADAPTER_REPO_PATH
 # RL fine-tuning defaults to LoRA.
 # Note: avoid LoRA on `lm_head` by default (huge vocab -> very high memory during log-prob computation).
 TARGET_MODULES="${TARGET_MODULES:-[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]}"
+# Whether to load a PEFT adapter from the checkpoint (e.g. `lora_adapter/`) or start a fresh adapter.
+# Some checkpoints already have LoRA merged into `model.safetensors`, in which case loading the adapter again will
+# double-apply LoRA and tank performance. Most VLA-Adapter exported checkpoints are already merged, so default to 0.
+# Set `LORA_LOAD_FROM_CHECKPOINT=1` only if you know the adapter is NOT merged into `model.safetensors`.
+LORA_LOAD_FROM_CHECKPOINT="${LORA_LOAD_FROM_CHECKPOINT:-0}"
 
 if [ -z "${NUM_GPUS:-}" ]; then
     if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
@@ -168,7 +173,7 @@ ALIGN_PATH="$ALIGN_PATH" TRAINER_RUNTIME_ENV="$TRAINER_RUNTIME_ENV" HYDRA_FULL_E
     data.accuracy_lower_bound=0 \
     data.accuracy_upper_bound=1 \
     data.oversample_factor=1 \
-    data.train_batch_size=32 \
+    data.train_batch_size=4 \
     data.val_batch_size=32 \
     data.max_prompt_length=256 \
     data.max_response_length=128 \
@@ -177,6 +182,7 @@ ALIGN_PATH="$ALIGN_PATH" TRAINER_RUNTIME_ENV="$TRAINER_RUNTIME_ENV" HYDRA_FULL_E
     actor_rollout_ref.model.vla_adapter_repo_path=$VLA_ADAPTER_REPO_PATH \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=32 \
+    actor_rollout_ref.model.lora_load_from_checkpoint=$LORA_LOAD_FROM_CHECKPOINT \
     actor_rollout_ref.model.target_modules=$TARGET_MODULES \
     actor_rollout_ref.model.action_token_len=7 \
     actor_rollout_ref.model.action_chunks_len=8 \
