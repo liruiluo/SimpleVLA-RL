@@ -38,6 +38,8 @@ if [ -d "$SFT_MODEL_PATH" ]; then
     _PROC_SRC="${VLA_ADAPTER_REPO_PATH}/prismatic/extern/hf/processing_prismatic.py"
     _MODEL_SRC="${VLA_ADAPTER_REPO_PATH}/prismatic/extern/hf/modeling_prismatic.py"
 
+    _ts() { date +%Y%m%d_%H%M%S; }
+
     if [ -f "$_CFG_SRC" ]; then
         _NEED_CFG=0
         if [ ! -f "${SFT_MODEL_PATH}/configuration_prismatic.py" ]; then
@@ -67,21 +69,33 @@ PY
 
         if [ "$_NEED_CFG" -eq 1 ]; then
             if [ -f "${SFT_MODEL_PATH}/configuration_prismatic.py" ]; then
-                cp -f "${SFT_MODEL_PATH}/configuration_prismatic.py" "${SFT_MODEL_PATH}/configuration_prismatic.py.back.$(date +%Y%m%d_%H%M%S)" || true
+                cp -f "${SFT_MODEL_PATH}/configuration_prismatic.py" "${SFT_MODEL_PATH}/configuration_prismatic.py.back.$(_ts)" || true
             fi
             cp -f "$_CFG_SRC" "${SFT_MODEL_PATH}/configuration_prismatic.py"
             echo "Patched configuration_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
         fi
     fi
 
-    if [ -f "$_PROC_SRC" ] && [ ! -f "${SFT_MODEL_PATH}/processing_prismatic.py" ]; then
-        cp -f "$_PROC_SRC" "${SFT_MODEL_PATH}/processing_prismatic.py"
-        echo "Patched missing processing_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+    if [ -f "$_PROC_SRC" ]; then
+        if [ ! -f "${SFT_MODEL_PATH}/processing_prismatic.py" ]; then
+            cp -f "$_PROC_SRC" "${SFT_MODEL_PATH}/processing_prismatic.py"
+            echo "Patched missing processing_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+        elif ! cmp -s "$_PROC_SRC" "${SFT_MODEL_PATH}/processing_prismatic.py"; then
+            cp -f "${SFT_MODEL_PATH}/processing_prismatic.py" "${SFT_MODEL_PATH}/processing_prismatic.py.back.$(_ts)" || true
+            cp -f "$_PROC_SRC" "${SFT_MODEL_PATH}/processing_prismatic.py"
+            echo "Synced processing_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+        fi
     fi
 
-    if [ -f "$_MODEL_SRC" ] && [ ! -f "${SFT_MODEL_PATH}/modeling_prismatic.py" ]; then
-        cp -f "$_MODEL_SRC" "${SFT_MODEL_PATH}/modeling_prismatic.py"
-        echo "Patched missing modeling_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+    if [ -f "$_MODEL_SRC" ]; then
+        if [ ! -f "${SFT_MODEL_PATH}/modeling_prismatic.py" ]; then
+            cp -f "$_MODEL_SRC" "${SFT_MODEL_PATH}/modeling_prismatic.py"
+            echo "Patched missing modeling_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+        elif ! cmp -s "$_MODEL_SRC" "${SFT_MODEL_PATH}/modeling_prismatic.py"; then
+            cp -f "${SFT_MODEL_PATH}/modeling_prismatic.py" "${SFT_MODEL_PATH}/modeling_prismatic.py.back.$(_ts)" || true
+            cp -f "$_MODEL_SRC" "${SFT_MODEL_PATH}/modeling_prismatic.py"
+            echo "Synced modeling_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+        fi
     fi
 
     # If this checkpoint was ever loaded with a wrong configuration_prismatic.py, Transformers may have cached it

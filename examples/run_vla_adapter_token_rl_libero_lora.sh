@@ -80,6 +80,49 @@ CKPT_PATH="$(_abspath "$CKPT_PATH")"
 VLA_ADAPTER_REPO_PATH="$(_abspath "$VLA_ADAPTER_REPO_PATH")"
 export VLA_ADAPTER_REPO_PATH
 
+# ---- Checkpoint HF dynamic-module sync (VLA-Adapter token checkpoints) ----
+# Some locally copied checkpoints may miss or carry stale versions of:
+#   - configuration_prismatic.py
+#   - processing_prismatic.py
+#   - modeling_prismatic.py
+# VLA-Adapter eval syncs these; do the same here so behavior matches VLA-Adapter.
+if [ -d "$SFT_MODEL_PATH" ] && [ -d "${VLA_ADAPTER_REPO_PATH}/prismatic/extern/hf" ]; then
+    _CFG_SRC="${VLA_ADAPTER_REPO_PATH}/prismatic/extern/hf/configuration_prismatic.py"
+    _PROC_SRC="${VLA_ADAPTER_REPO_PATH}/prismatic/extern/hf/processing_prismatic.py"
+    _MODEL_SRC="${VLA_ADAPTER_REPO_PATH}/prismatic/extern/hf/modeling_prismatic.py"
+    _ts() { date +%Y%m%d_%H%M%S; }
+
+    if [ -f "$_CFG_SRC" ]; then
+        if [ ! -f "${SFT_MODEL_PATH}/configuration_prismatic.py" ] || ! cmp -s "$_CFG_SRC" "${SFT_MODEL_PATH}/configuration_prismatic.py"; then
+            if [ -f "${SFT_MODEL_PATH}/configuration_prismatic.py" ]; then
+                cp -f "${SFT_MODEL_PATH}/configuration_prismatic.py" "${SFT_MODEL_PATH}/configuration_prismatic.py.back.$(_ts)" || true
+            fi
+            cp -f "$_CFG_SRC" "${SFT_MODEL_PATH}/configuration_prismatic.py"
+            echo "Synced configuration_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+        fi
+    fi
+
+    if [ -f "$_PROC_SRC" ]; then
+        if [ ! -f "${SFT_MODEL_PATH}/processing_prismatic.py" ] || ! cmp -s "$_PROC_SRC" "${SFT_MODEL_PATH}/processing_prismatic.py"; then
+            if [ -f "${SFT_MODEL_PATH}/processing_prismatic.py" ]; then
+                cp -f "${SFT_MODEL_PATH}/processing_prismatic.py" "${SFT_MODEL_PATH}/processing_prismatic.py.back.$(_ts)" || true
+            fi
+            cp -f "$_PROC_SRC" "${SFT_MODEL_PATH}/processing_prismatic.py"
+            echo "Synced processing_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+        fi
+    fi
+
+    if [ -f "$_MODEL_SRC" ]; then
+        if [ ! -f "${SFT_MODEL_PATH}/modeling_prismatic.py" ] || ! cmp -s "$_MODEL_SRC" "${SFT_MODEL_PATH}/modeling_prismatic.py"; then
+            if [ -f "${SFT_MODEL_PATH}/modeling_prismatic.py" ]; then
+                cp -f "${SFT_MODEL_PATH}/modeling_prismatic.py" "${SFT_MODEL_PATH}/modeling_prismatic.py.back.$(_ts)" || true
+            fi
+            cp -f "$_MODEL_SRC" "${SFT_MODEL_PATH}/modeling_prismatic.py"
+            echo "Synced modeling_prismatic.py from VLA-Adapter into: ${SFT_MODEL_PATH}" >&2
+        fi
+    fi
+fi
+
 # RL fine-tuning defaults to LoRA.
 # Note: avoid LoRA on `lm_head` by default (huge vocab -> very high memory during log-prob computation).
 TARGET_MODULES="${TARGET_MODULES:-[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]}"
