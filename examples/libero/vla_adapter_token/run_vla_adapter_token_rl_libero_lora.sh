@@ -156,6 +156,12 @@ if [ -z "${NUM_GPUS:-}" ]; then
 fi
 NUM_NODES="${NUM_NODES:-1}"
 
+# Ray's default object store can reserve a large chunk of host RAM. Combined with LIBERO env multiprocessing,
+# this can trip Ray's OOM killer on single-GPU workstations. Keep it conservative unless explicitly overridden.
+if [ -z "${VERL_RAY_OBJECT_STORE_MEMORY_GB:-}" ] && [ "${NUM_GPUS}" -le 1 ]; then
+    export VERL_RAY_OBJECT_STORE_MEMORY_GB=4
+fi
+
 ALIGN_PATH="${ALIGN_PATH:-${REPO_ROOT}/align.json}"
 TRAINER_RUNTIME_ENV="${TRAINER_RUNTIME_ENV:-none}"
 
@@ -260,10 +266,10 @@ ALIGN_PATH="$ALIGN_PATH" TRAINER_RUNTIME_ENV="$TRAINER_RUNTIME_ENV" HYDRA_FULL_E
     actor_rollout_ref.rollout.num_images_in_input=2 \
     actor_rollout_ref.rollout.use_minivlm=True \
     actor_rollout_ref.rollout.use_proprio=False \
-    actor_rollout_ref.rollout.val_micro_batch_size=16 \
+    actor_rollout_ref.rollout.val_micro_batch_size=8 \
     actor_rollout_ref.rollout.temperature=1.6 \
     actor_rollout_ref.rollout.experiment_name=$EXPERIMENT_NAME \
-    actor_rollout_ref.rollout.micro_batch_size=2 \
+    actor_rollout_ref.rollout.micro_batch_size=1 \
     actor_rollout_ref.rollout.unnorm_key=$DATASET_NAME \
     actor_rollout_ref.rollout.task_suite_name=$DATASET_NAME \
     actor_rollout_ref.rollout.pretrained_checkpoint=$SFT_MODEL_PATH \
