@@ -235,8 +235,8 @@ ALIGN_PATH="$ALIGN_PATH" TRAINER_RUNTIME_ENV="$TRAINER_RUNTIME_ENV" HYDRA_FULL_E
     actor_rollout_ref.actor.ppo_micro_batch_size=$NUM_GPUS \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.grad_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.grad_offload=False  \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False  \
     actor_rollout_ref.actor.grad_clip=1 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
@@ -262,7 +262,7 @@ ALIGN_PATH="$ALIGN_PATH" TRAINER_RUNTIME_ENV="$TRAINER_RUNTIME_ENV" HYDRA_FULL_E
     actor_rollout_ref.rollout.name=hf \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.98 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=1 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     algorithm.kl_ctrl.kl_coef=0.00 \
     trainer.logger=$LOGGER \
     trainer.project_name=$PROJECT_NAME \
