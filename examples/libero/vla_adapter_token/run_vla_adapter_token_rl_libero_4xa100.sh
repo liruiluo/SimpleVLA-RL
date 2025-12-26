@@ -3,7 +3,7 @@ set -euo pipefail
 set -x
 
 # 4xA100 single-node launcher for VLA-Adapter token RL (LoRA by default).
-# This is a thin wrapper around `examples/run_vla_adapter_token_rl_libero_lora.sh`.
+# This is a thin wrapper around `examples/libero/vla_adapter_token/run_vla_adapter_token_rl_libero_lora.sh`.
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -12,7 +12,19 @@ if [ -z "${REPO_ROOT:-}" ]; then
     elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
         REPO_ROOT="$(cd "$PWD/.." && pwd)"
     else
-        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
     fi
 fi
 
@@ -31,7 +43,7 @@ export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 # export VERL_RAY_OBJECT_STORE_MEMORY_GB=20
 
 # Prefer not to offload on A100 for speed; override the base script's defaults via trailing Hydra args.
-bash "${REPO_ROOT}/examples/run_vla_adapter_token_rl_libero_lora.sh" \
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/run_vla_adapter_token_rl_libero_lora.sh" \
   trainer.save_freq=-1 \
   trainer.test_freq=-1 \
   data.val_batch_size=64 \

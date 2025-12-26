@@ -11,8 +11,20 @@ if [ -z "${REPO_ROOT:-}" ]; then
     elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
         REPO_ROOT="$(cd "$PWD/.." && pwd)"
     else
-        # Fallback: use script location (可能在 Slurm spool 下，仅作为兜底)
-        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        # Fallback: walk up from script location until we find `verl/` and `examples/`.
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
     fi
 fi
 
@@ -114,7 +126,7 @@ fi
 mkdir -p "${CKPT_PATH}/${PROJECT_NAME}/${EXPERIMENT_NAME}"
 
 # Ensure the VLA checkpoint has the latest OpenVLA-OFT code
-bash "${REPO_ROOT}/examples/overwrite_vla_ckpt_utils.sh" "$SFT_MODEL_PATH"
+bash "${REPO_ROOT}/examples/utils/overwrite_vla_ckpt_utils.sh" "$SFT_MODEL_PATH"
 
 HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     data.task_suite_name=$DATASET_NAME \

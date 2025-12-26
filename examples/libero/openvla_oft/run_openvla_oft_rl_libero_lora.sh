@@ -4,7 +4,7 @@ set -x
 
 # LoRA-enabled LIBERO RL training launcher.
 # Usage:
-#   bash examples/run_openvla_oft_rl_libero_lora.sh
+#   bash examples/libero/openvla_oft/run_openvla_oft_rl_libero_lora.sh
 # Optional overrides (env vars):
 #   SFT_MODEL_PATH=/path/to/sft_ckpt CKPT_PATH=/path/to/save \
 #   DATASET_NAME=libero_10 NUM_GPUS=8 NUM_NODES=1 \
@@ -18,7 +18,19 @@ if [ -z "${REPO_ROOT:-}" ]; then
     elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
         REPO_ROOT="$(cd "$PWD/.." && pwd)"
     else
-        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
     fi
 fi
 
@@ -133,7 +145,7 @@ if ! "${REPO_ROOT}/env/bin/python" -c "import libero" >/dev/null 2>&1; then
 fi
 
 # Ensure the VLA checkpoint has the latest OpenVLA-OFT code
-bash "${REPO_ROOT}/examples/overwrite_vla_ckpt_utils.sh" "$SFT_MODEL_PATH"
+bash "${REPO_ROOT}/examples/utils/overwrite_vla_ckpt_utils.sh" "$SFT_MODEL_PATH"
 
 HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     data.task_suite_name=$DATASET_NAME \

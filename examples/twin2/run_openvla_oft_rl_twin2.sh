@@ -1,4 +1,28 @@
+#!/bin/bash
 set -x
+
+# Determine repo root.
+if [ -z "${REPO_ROOT:-}" ]; then
+    if [ -d "$PWD/verl" ] && [ -d "$PWD/examples" ]; then
+        REPO_ROOT="$PWD"
+    elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
+        REPO_ROOT="$(cd "$PWD/.." && pwd)"
+    else
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
+    fi
+fi
 
 export NCCL_DEBUG=WARN 
 export WANDB_API_KEY='YOUR WANDB KEY'
@@ -38,15 +62,15 @@ EXPERIMENT_NAME='MODIFIED YOURSELF e.g. twin2_lift_pot_sft1k_rl_tmp16_clip08-128
 # For openvla-oft Libero-Long traj1 SFT or traj all SFT models can be find in https://huggingface.co/collections/Haozhan72/simplevla-rl-6833311430cd9df52aeb1f86
 SFT_MODEL_PATH="YOUR SFT_MODEL_PATH"
 CKPT_PATH="THE PATH YOU WANT TO SAVE YOUR CKPT"
-# Currently Supported DATASET_NAME tasks for robotwin2.0 can be found at examples/robotwin2_tasks_info.txt
+# Currently Supported DATASET_NAME tasks for robotwin2.0 can be found at examples/twin2/robotwin2_tasks_info.txt
 DATASET_NAME=TASK_NAME_YOU_SELECT
-TRAJ_MINI_BATCH_SIZE=8 #NEED TO CHECK! The specific values are in examples/robotwin2_tasks_info.txt
+TRAJ_MINI_BATCH_SIZE=8 #NEED TO CHECK! The specific values are in examples/twin2/robotwin2_tasks_info.txt
 VLA_NAME="openvla-oft"
 NUM_GPUS=8
 # If you want to use 2*8 GPU to RL. Set NUM_NODES=2
 NUM_NODES=1 
 ALIGN_PATH="YOUR PATH TO SimpleVLA-RL/align.json"
-bash examples/overwrite_vla_ckpt_utils.sh $SFT_MODEL_PATH 
+bash "${REPO_ROOT}/examples/utils/overwrite_vla_ckpt_utils.sh" "$SFT_MODEL_PATH"
 
 HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     data.task_suite_name=robotwin2_$DATASET_NAME \
@@ -119,4 +143,3 @@ HYDRA_FULL_ERROR=1 python -u -m verl.trainer.main_ppo \
     trainer.runtime_env=$ALIGN_PATH \
     trainer.wandb_mode=online \
     trainer.val_before_train=True \
-

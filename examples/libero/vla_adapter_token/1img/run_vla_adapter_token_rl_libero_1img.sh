@@ -3,7 +3,7 @@ set -euo pipefail
 set -x
 
 # 1-image launcher for VLA-Adapter token RL on LIBERO.
-# Wraps `examples/run_vla_adapter_token_rl_libero_lora.sh` and forces `num_images_in_input=1`.
+# Wraps `examples/libero/vla_adapter_token/run_vla_adapter_token_rl_libero_lora.sh` and forces `num_images_in_input=1`.
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -12,7 +12,19 @@ if [ -z "${REPO_ROOT:-}" ]; then
     elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
         REPO_ROOT="$(cd "$PWD/.." && pwd)"
     else
-        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
     fi
 fi
 
@@ -186,7 +198,7 @@ NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-1}"
 LORA_LOAD_FROM_CHECKPOINT="${LORA_LOAD_FROM_CHECKPOINT:-0}"
 export LORA_LOAD_FROM_CHECKPOINT
 
-bash "${REPO_ROOT}/examples/run_vla_adapter_token_rl_libero_lora.sh" \
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/run_vla_adapter_token_rl_libero_lora.sh" \
   actor_rollout_ref.actor.num_images_in_input="${NUM_IMAGES_IN_INPUT}" \
   actor_rollout_ref.rollout.num_images_in_input="${NUM_IMAGES_IN_INPUT}" \
   "$@"

@@ -108,12 +108,12 @@ Before running the training script, ensure the following configurations are prop
    Replace the `WANDB_API_KEY` field in `SimpleVLA-RL/align.json` with your own WandB API key.
 
 - **Modify Key Variables**  
-   Update the following variables in `examples/run_openvla_oft_rl_libero/twin2.sh` as needed:
+   Update the following variables in `examples/libero/openvla_oft/run_openvla_oft_rl_libero.sh` (LIBERO) or `examples/twin2/run_openvla_oft_rl_twin2.sh` (RoboTwin2.0) as needed:
   - `WANDB_API_KEY`: Your WandB API key.
   - `EXPERIMENT_NAME`: The name of your experiment. You can choose any name.
   - `SFT_MODEL_PATH`: Path to your SFT model.
   - `CKPT_PATH`: Path where your checkpoints will be saved.
-  - `DATASET_NAME`: For detailed options, refer to `examples/run_openvla_oft_rl_libero/twin2.sh`.
+  - `DATASET_NAME`: For detailed options, refer to the corresponding script above.
   - `ALIGN_PATH`: Path to the `SimpleVLA-RL/align.json` file.
   - `NUM_GPUS`: Number of GPUs available per node (e.g., `8`).
   - `NUM_NODES`: Number of nodes used for RL training (e.g., `1`).
@@ -129,20 +129,20 @@ Before running the training script, ensure the following configurations are prop
    Use the following command to start RL training for OpenVLA-OFT on the LIBERO or RoboTwin2.0 benchmark:
   
   ```bash
-  bash examples/run_openvla_oft_rl_libero.sh
+  bash examples/libero/openvla_oft/run_openvla_oft_rl_libero.sh
   or
-  bash examples/run_openvla_oft_rl_twin2.sh
+  bash examples/twin2/run_openvla_oft_rl_twin2.sh
   ```
   
 
 #### 4. Run Evaluation
 
-To evaluate the performance of your model, enable evaluation mode by setting `trainer.val_only=True` in `examples/run_openvla_oft_rl_libero/twin2.sh`. Then, execute the same script:
+To evaluate the performance of your model, enable evaluation mode by setting `trainer.val_only=True` in `examples/libero/openvla_oft/run_openvla_oft_rl_libero.sh` or `examples/twin2/run_openvla_oft_rl_twin2.sh`. Then, execute the same script:
 
 ```bash
-bash examples/run_openvla_oft_rl_libero.sh
+bash examples/libero/openvla_oft/run_openvla_oft_rl_libero.sh
 or
-bash examples/run_openvla_oft_rl_twin2.sh
+bash examples/twin2/run_openvla_oft_rl_twin2.sh
 ```
 
 # 📃 Main Results

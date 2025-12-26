@@ -12,7 +12,19 @@ if [ -z "${REPO_ROOT:-}" ]; then
     elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
         REPO_ROOT="$(cd "$PWD/.." && pwd)"
     else
-        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
     fi
 fi
 
@@ -30,5 +42,4 @@ if [ ! -d "$SFT_MODEL_PATH" ]; then
     exit 2
 fi
 
-bash "${REPO_ROOT}/examples/run_vla_adapter_token_rl_libero_1img.sh" "$@"
-
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"
