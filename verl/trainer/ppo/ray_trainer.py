@@ -25,7 +25,7 @@ from functools import partial
 from pprint import pprint
 from typing import Callable, Type, Tuple, Union
 import uuid
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf, open_dict, ListConfig
 import numpy as np
 from codetiming import Timer
 
@@ -294,12 +294,19 @@ class RayTrainer(object):
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.utils.dataset.rob_dataset import LIBERO_Dataset, Robotwin_Dataset, collate_fn
         if "libero" in self.config.data.task_suite_name:
+            task_ids = None
+            if hasattr(self.config.data, "get"):
+                task_ids = self.config.data.get("task_ids", None)
+            if task_ids is not None and isinstance(task_ids, ListConfig):
+                task_ids = list(task_ids)
             self.train_dataset = LIBERO_Dataset(self.config.data.task_suite_name,
                                                 num_trials_per_task=self.config.data.num_trials_per_task,
-                                                train_val ="train")
+                                                train_val ="train",
+                                                task_ids=task_ids)
             self.val_dataset = LIBERO_Dataset(self.config.data.task_suite_name,
                                             num_trials_per_task=self.config.data.num_trials_per_task,
-                                            train_val ="valid")
+                                            train_val ="valid",
+                                            task_ids=task_ids)
         elif "robotwin" in self.config.data.task_suite_name:
             # (cjh) We assume here that data set names are "robotwin_{task_name}" or "robotwin_all"
             self.train_dataset = Robotwin_Dataset(self.config.data.task_suite_name,
@@ -498,6 +505,66 @@ class RayTrainer(object):
         dp_size = self.actor_rollout_wg.world_size // self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
         batch_size = self.config.data.train_batch_size
         n_samples = self.config.data.n_samples
+
+        use_crl = bool(getattr(self.config.data, "use_crl", False))
+        crl_eval_on_switch = bool(self.config.trainer.get("crl_eval_on_switch", False))
+        crl_task_ids: list[int] | None = None
+        crl_steps_per_task: int | None = None
+        crl_task_idx = 0
+        crl_next_switch_step: int | None = None
+        crl_current_task_id: int | None = None
+        crl_success_after_train: dict[int, float] = {}
+
+        if use_crl:
+            if "libero" not in self.config.data.task_suite_name:
+                raise NotImplementedError("`data.use_crl=True` is only supported for LIBERO task suites right now.")
+
+            # Determine task order.
+            raw_task_ids = None
+            if hasattr(self.config.data, "get"):
+                raw_task_ids = self.config.data.get("crl_task_ids", None)
+            if raw_task_ids is not None:
+                if isinstance(raw_task_ids, ListConfig):
+                    raw_task_ids = list(raw_task_ids)
+                crl_task_ids = [int(x) for x in raw_task_ids]
+            else:
+                # Infer from the LIBERO benchmark suite.
+                from verl.utils.dataset.rob_dataset import ensure_libero_importable, benchmark
+                ensure_libero_importable()
+                benchmark_dict = benchmark.get_benchmark_dict()
+                task_suite = benchmark_dict[self.config.data.task_suite_name]()
+                crl_task_ids = list(range(int(task_suite.n_tasks)))
+
+            if len(crl_task_ids) == 0:
+                raise ValueError("`data.use_crl=True` but `crl_task_ids` resolved to an empty list.")
+
+            # Determine how many RL updates per task.
+            crl_steps_per_task = self.config.trainer.get("crl_steps_per_task", None)
+            if crl_steps_per_task is not None:
+                crl_steps_per_task = int(crl_steps_per_task)
+                if crl_steps_per_task <= 0:
+                    raise ValueError(f"`trainer.crl_steps_per_task` must be > 0, got {crl_steps_per_task}")
+            else:
+                if target_steps is None:
+                    raise ValueError(
+                        "`data.use_crl=True` requires either `trainer.crl_steps_per_task` or `trainer.total_steps`."
+                    )
+                import math
+                crl_steps_per_task = int(math.ceil(float(target_steps) / float(len(crl_task_ids))))
+
+            # Activate the first task by restricting the dataset.
+            with open_dict(self.config):
+                self.config.data.task_ids = [int(crl_task_ids[0])]
+            self._create_dataloader()
+            self.train_dataloader.start_new_epoch()
+
+            crl_task_idx = 0
+            crl_next_switch_step = crl_steps_per_task  # switch after this many global steps
+            crl_current_task_id = int(crl_task_ids[0])
+            print(
+                f"[CRL] Enabled: suite={self.config.data.task_suite_name} task_ids={crl_task_ids} steps_per_task={crl_steps_per_task}"
+            )
+            print(f"[CRL] Starting task_id={crl_current_task_id} at global_step={global_steps}")
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -701,6 +768,8 @@ class RayTrainer(object):
                     metrics.update(data_metrics)
                 with Timer(name='logging3', text="{name}: {seconds:.1f} seconds") as timer:
                     # TODO: make a canonical logger that supports various backend
+                    if use_crl and crl_current_task_id is not None:
+                        metrics['crl/task_id'] = crl_current_task_id
                     logger.log(data=metrics, step=global_steps)
 
                 if self.config.trainer.save_freq > 0 and (global_steps + 1) % self.config.trainer.save_freq == 0:
@@ -724,6 +793,40 @@ class RayTrainer(object):
                         self.rm_wg.save_checkpoint(prm_local_path, prm_remote_path)
 
                 global_steps += 1
+
+                # Continual/sequential task switch (LIBERO only).
+                if use_crl and crl_task_ids is not None and crl_steps_per_task is not None and crl_next_switch_step is not None:
+                    # Optionally evaluate right after finishing the current task segment (before switching).
+                    if (
+                        crl_eval_on_switch
+                        and self.val_reward_fn is not None
+                        and crl_current_task_id is not None
+                        and (global_steps >= crl_next_switch_step or (target_steps is not None and global_steps >= target_steps))
+                        and crl_current_task_id not in crl_success_after_train
+                    ):
+                        val_metrics = self._validate(global_steps=global_steps)
+                        task_success = float(val_metrics.get("test_score/all", float("nan")))
+                        crl_success_after_train[int(crl_current_task_id)] = task_success
+                        logger.log(
+                            data={
+                                "crl/task_id": float(crl_current_task_id),
+                                "crl/task_success_after_train": task_success,
+                            },
+                            step=global_steps,
+                        )
+                        print(f"[CRL] task_id={crl_current_task_id} success_after_train={task_success:.4f}")
+
+                    if (target_steps is None or global_steps < target_steps) and global_steps >= crl_next_switch_step and (crl_task_idx + 1) < len(crl_task_ids):
+                        crl_task_idx += 1
+                        next_task_id = int(crl_task_ids[crl_task_idx])
+                        with open_dict(self.config):
+                            self.config.data.task_ids = [next_task_id]
+                        self._create_dataloader()
+                        self.train_dataloader.start_new_epoch()
+                        crl_current_task_id = next_task_id
+                        crl_next_switch_step = (crl_task_idx + 1) * crl_steps_per_task
+                        print(f"[CRL] Switched to task_id={next_task_id} at global_step={global_steps}")
+
                 if target_steps is not None and global_steps >= target_steps:
                     stop_training = True
                     break
@@ -736,6 +839,20 @@ class RayTrainer(object):
             val_metrics = self._validate(global_steps=global_steps)
             pprint(f'Final validation metrics: {val_metrics}')
             logger.log(data=val_metrics, step=global_steps)
+
+        # CRL summary: ensure the final task gets included and report mean success across tasks.
+        if use_crl and crl_eval_on_switch and self.val_reward_fn is not None and crl_task_ids is not None:
+            if crl_current_task_id is not None and int(crl_current_task_id) not in crl_success_after_train:
+                # Use the just-computed `val_metrics` for the final task if available.
+                task_success = float(val_metrics.get("test_score/all", float("nan"))) if 'val_metrics' in locals() else float("nan")
+                crl_success_after_train[int(crl_current_task_id)] = task_success
+                print(f"[CRL] task_id={crl_current_task_id} success_after_train={task_success:.4f}")
+
+            ordered = [int(t) for t in crl_task_ids if int(t) in crl_success_after_train]
+            if len(ordered) > 0:
+                mean_success = float(np.mean([crl_success_after_train[t] for t in ordered]))
+                logger.log(data={"crl/mean_success_after_train": mean_success}, step=global_steps)
+                print(f"[CRL] mean_success_after_train={mean_success:.4f} over task_ids={ordered}")
 
     def filter_format(self, reward_tensor, batch, n_samples):
         """

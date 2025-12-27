@@ -2,13 +2,8 @@
 set -euo pipefail
 set -x
 
-# 4xGPU single-node launcher for VLA-Adapter token RL on LIBERO (libero_object, 1-image checkpoint).
-# Thin wrapper around `examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_object_1img.sh`.
-#
-# Usage:
-#   bash examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_object_1img_4xa100.sh
-#   # optional: pass extra Hydra overrides at the end
-#   bash examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_object_1img_4xa100.sh trainer.total_steps=230
+# 4xA100 single-node launcher for VLA-Adapter token RL (LoRA by default).
+# This is a thin wrapper around `examples/libero/vla_adapter_token/rl/run_vla_adapter_token_rl_libero_lora.sh`.
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -39,15 +34,16 @@ export NUM_GPUS="${NUM_GPUS:-4}"
 export NUM_NODES="${NUM_NODES:-1}"
 
 # ---- Headless rendering (LIBERO / robosuite) ----
-# If EGL is not available, try: `MUJOCO_GL=osmesa` (slower).
+# If EGL is not available on your Lambda image, try: `MUJOCO_GL=osmesa` (slower but uses no GPU for rendering).
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
-# Ray memory knobs (avoid extra background processes).
+# Ray memory knobs (avoid OS OOM-killer incidents).
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
+# Optional: set this only if you know your node has enough RAM.
+# export VERL_RAY_OBJECT_STORE_MEMORY_GB=20
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_object_1img.sh" \
-  trainer.save_freq=-1 \
-  trainer.test_freq=-1 \
+# Prefer not to offload on A100 for speed; override the base script's defaults via trailing Hydra args.
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/run_vla_adapter_token_rl_libero_lora.sh" \
   data.val_batch_size=64 \
   actor_rollout_ref.rollout.micro_batch_size=4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \

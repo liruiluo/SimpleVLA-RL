@@ -2,6 +2,12 @@ data:
   tokenizer: null
   task_suite_name: libero_10
   num_trials_per_task: 50
+  # Continual/Sequential RL: train tasks in a fixed order (by filtering `task_id`) instead of multi-task sampling.
+  use_crl: False
+  # Optional explicit task order (e.g. [0,1,2,3,4,5,6,7,8,9]); if null, infer from the LIBERO suite.
+  crl_task_ids: null
+  # Internal: optionally restrict the dataset to a subset of task ids (set automatically by CRL).
+  task_ids: null
   filter_warmup: False
   prompt_key: prompt
   system_prompt: null
@@ -11,7 +17,7 @@ data:
   val_batch_size: 1312
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
   return_raw_chat: False
-  n_samples: 1
+  n_samples: 2
   filter_accuracy: False
   filter_truncated: False
   accuracy_lower_bound: 0.0
@@ -258,6 +264,12 @@ trainer:
   total_epochs: 30
   total_training_steps: null
   total_steps: null  # Stop after N RL updates (global_steps); overrides total_epochs if set.
+  # If `data.use_crl=True`, optionally set how many RL updates to spend per task before moving to the next.
+  # If null, we split `trainer.total_steps` evenly across `data.crl_task_ids` (ceil).
+  crl_steps_per_task: null
+  # If `data.use_crl=True`, run validation right after finishing each task segment and report mean success
+  # across tasks, where each task success is taken right after that task is trained.
+  crl_eval_on_switch: True
   project_name: verl_examples
   experiment_name: gsm8k
   logger: ['console', 'wandb']

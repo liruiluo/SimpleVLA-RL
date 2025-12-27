@@ -6,7 +6,7 @@ set -x
 # Placeholder: set `SFT_MODEL_PATH=/path/to/goal_1img_ckpt` before running.
 #
 # Usage:
-#   SFT_MODEL_PATH=/abs/path/to/goal_1img_ckpt bash examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_goal_1img_moe_lora.sh
+#   SFT_MODEL_PATH=/abs/path/to/goal_1img_ckpt bash examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_goal_1img_moe_lora.sh
 #   MOE_NUM_EXPERTS=3 MOE_TOP_K=2 bash ..._moe_lora.sh
 #   # override rank if needed:
 #   bash ..._moe_lora.sh actor_rollout_ref.model.lora_rank=16
@@ -54,7 +54,7 @@ fi
 MOE_NUM_EXPERTS="${MOE_NUM_EXPERTS:-3}"
 MOE_TOP_K="${MOE_TOP_K:-2}"
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" \
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/run_vla_adapter_token_rl_libero_1img.sh" \
   actor_rollout_ref.model.use_moe_lora=True \
   actor_rollout_ref.model.moe_num_experts="${MOE_NUM_EXPERTS}" \
   actor_rollout_ref.model.moe_top_k="${MOE_TOP_K}" \

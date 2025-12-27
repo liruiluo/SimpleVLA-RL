@@ -2,8 +2,7 @@
 set -euo pipefail
 set -x
 
-# 1-image launcher for LIBERO-Goal VLA-Adapter token RL/eval.
-# Placeholder: set `SFT_MODEL_PATH=/path/to/goal_1img_ckpt` before running.
+# CRL (sequential tasks) launcher for LIBERO-Object, 1-image, LoRA, 4xGPU single node.
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -28,21 +27,14 @@ if [ -z "${REPO_ROOT:-}" ]; then
     fi
 fi
 
-# TODO: replace with the actual goal 1img ckpt path once available.
-SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/TODO-goal-1img-ckpt}"
-export SFT_MODEL_PATH
-
-DATASET_NAME="${DATASET_NAME:-libero_goal}"
-export DATASET_NAME
-
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_goal_vla_adapter_token_rl_1img}"
-export EXPERIMENT_NAME
-
-if [ ! -d "$SFT_MODEL_PATH" ]; then
-    echo "ERROR: goal 1img checkpoint not found: $SFT_MODEL_PATH" >&2
-    echo "Set it via: SFT_MODEL_PATH=/abs/path/to/goal_1img_ckpt bash $0 ..." >&2
-    exit 2
+_args=(data.use_crl=True trainer.crl_eval_on_switch=True)
+if [ -n "${CRL_STEPS_PER_TASK:-}" ]; then
+  _args+=(trainer.crl_steps_per_task="${CRL_STEPS_PER_TASK}")
+fi
+if [ -n "${CRL_TASK_IDS:-}" ]; then
+  _args+=(data.crl_task_ids="${CRL_TASK_IDS}")
 fi
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"
-
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_object_1img_4xa100.sh" \
+  "${_args[@]}" \
+  "$@"

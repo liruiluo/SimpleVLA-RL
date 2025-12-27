@@ -2,11 +2,8 @@
 set -euo pipefail
 set -x
 
-# 1-image launcher for LIBERO-Long VLA-Adapter token RL/eval.
-# Placeholder: set `SFT_MODEL_PATH=/path/to/long_1img_ckpt` before running.
-#
-# Note: VLA-Adapter uses "LIBERO-Long" naming; in SimpleVLA-RL the task suites are typically `libero_10`/`libero_90`.
-# If needed, override `DATASET_NAME` at runtime.
+# 1-image launcher for LIBERO-Object VLA-Adapter token RL/eval.
+# Defaults to the 1img libero_object checkpoint; pass extra Hydra overrides as "$@".
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -31,22 +28,18 @@ if [ -z "${REPO_ROOT:-}" ]; then
     fi
 fi
 
-# TODO: replace with the actual long 1img ckpt path once available.
-SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/TODO-long-1img-ckpt}"
+SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/configs+libero_object_no_noops+b64+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--token--1img--libero_object_no_noops--2025-12-25_00-20-20--2500_chkpt}"
 export SFT_MODEL_PATH
 
-DATASET_NAME="${DATASET_NAME:-libero_10}"
+DATASET_NAME="${DATASET_NAME:-libero_object}"
 export DATASET_NAME
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_long_vla_adapter_token_rl_1img}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_object_vla_adapter_token_rl_1img}"
 export EXPERIMENT_NAME
 
 if [ ! -d "$SFT_MODEL_PATH" ]; then
-    echo "ERROR: long 1img checkpoint not found: $SFT_MODEL_PATH" >&2
-    echo "Set it via: SFT_MODEL_PATH=/abs/path/to/long_1img_ckpt bash $0 ..." >&2
-    echo "Optionally override suite: DATASET_NAME=libero_90 bash $0 ..." >&2
+    echo "ERROR: checkpoint not found: $SFT_MODEL_PATH" >&2
     exit 2
 fi
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"
-
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"

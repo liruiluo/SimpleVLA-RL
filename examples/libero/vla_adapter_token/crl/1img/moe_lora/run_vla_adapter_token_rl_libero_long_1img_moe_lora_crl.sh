@@ -1,0 +1,40 @@
+#!/bin/bash
+set -euo pipefail
+set -x
+
+# CRL (sequential tasks) launcher for LIBERO-Long, 1-image, MoE-LoRA.
+
+# Determine repo root.
+if [ -z "${REPO_ROOT:-}" ]; then
+    if [ -d "$PWD/verl" ] && [ -d "$PWD/examples" ]; then
+        REPO_ROOT="$PWD"
+    elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
+        REPO_ROOT="$(cd "$PWD/.." && pwd)"
+    else
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
+    fi
+fi
+
+_args=(data.use_crl=True trainer.crl_eval_on_switch=True)
+if [ -n "${CRL_STEPS_PER_TASK:-}" ]; then
+  _args+=(trainer.crl_steps_per_task="${CRL_STEPS_PER_TASK}")
+fi
+if [ -n "${CRL_TASK_IDS:-}" ]; then
+  _args+=(data.crl_task_ids="${CRL_TASK_IDS}")
+fi
+
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_long_1img_moe_lora.sh" \
+  "${_args[@]}" \
+  "$@"

@@ -51,7 +51,7 @@ export VERL_SAVE_ROLLOUT_VIDEOS="${VERL_SAVE_ROLLOUT_VIDEOS:-0}"
 # These knobs avoid OS OOM-killer incidents (which can kill VSCode/Electron even if training continues).
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 # Optional (unset by default): override Ray object store memory. If set too large, Ray can fail to start.
-# Example: `VERL_RAY_OBJECT_STORE_MEMORY_GB=2 ./examples/libero/vla_adapter_token/run_vla_adapter_token_rl_libero_lora.sh`
+# Example: `VERL_RAY_OBJECT_STORE_MEMORY_GB=2 ./examples/libero/vla_adapter_token/rl/run_vla_adapter_token_rl_libero_lora.sh`
 if [ -n "${VERL_RAY_OBJECT_STORE_MEMORY_GB:-}" ]; then
     export VERL_RAY_OBJECT_STORE_MEMORY_GB
 fi

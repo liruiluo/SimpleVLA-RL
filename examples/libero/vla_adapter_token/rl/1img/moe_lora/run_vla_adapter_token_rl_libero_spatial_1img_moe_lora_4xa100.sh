@@ -2,11 +2,11 @@
 set -euo pipefail
 set -x
 
-# 4xGPU single-node launcher for VLA-Adapter token RL using MoE-LoRA on LIBERO (libero_object, 1-image checkpoint).
-# Thin wrapper around `examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_object_1img_moe_lora.sh`.
+# 4xGPU single-node launcher for VLA-Adapter token RL using MoE-LoRA on LIBERO (libero_spatial, 1-image checkpoint).
+# Thin wrapper around `examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_spatial_1img_moe_lora.sh`.
 #
 # Usage:
-#   bash examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_object_1img_moe_lora_4xa100.sh
+#   bash examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_spatial_1img_moe_lora_4xa100.sh
 #   MOE_NUM_EXPERTS=3 MOE_TOP_K=2 bash ..._moe_lora_4xa100.sh trainer.total_steps=10
 
 # Determine repo root.
@@ -44,7 +44,7 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # Ray memory knobs (avoid extra background processes).
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_object_1img_moe_lora.sh" \
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_spatial_1img_moe_lora.sh" \
   data.val_batch_size=64 \
   actor_rollout_ref.rollout.micro_batch_size=4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \

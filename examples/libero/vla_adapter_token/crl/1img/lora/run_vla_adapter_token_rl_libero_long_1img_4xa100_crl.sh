@@ -2,8 +2,7 @@
 set -euo pipefail
 set -x
 
-# 1-image launcher for LIBERO-Object VLA-Adapter token RL/eval.
-# Defaults to the 1img libero_object checkpoint; pass extra Hydra overrides as "$@".
+# CRL (sequential tasks) launcher for LIBERO-Long, 1-image, LoRA, 4xGPU single node.
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -28,19 +27,14 @@ if [ -z "${REPO_ROOT:-}" ]; then
     fi
 fi
 
-SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/configs+libero_object_no_noops+b64+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--token--1img--libero_object_no_noops--2025-12-25_00-20-20--2500_chkpt}"
-export SFT_MODEL_PATH
-
-DATASET_NAME="${DATASET_NAME:-libero_object}"
-export DATASET_NAME
-
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_object_vla_adapter_token_rl_1img}"
-export EXPERIMENT_NAME
-
-if [ ! -d "$SFT_MODEL_PATH" ]; then
-    echo "ERROR: checkpoint not found: $SFT_MODEL_PATH" >&2
-    exit 2
+_args=(data.use_crl=True trainer.crl_eval_on_switch=True)
+if [ -n "${CRL_STEPS_PER_TASK:-}" ]; then
+  _args+=(trainer.crl_steps_per_task="${CRL_STEPS_PER_TASK}")
+fi
+if [ -n "${CRL_TASK_IDS:-}" ]; then
+  _args+=(data.crl_task_ids="${CRL_TASK_IDS}")
 fi
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"
-
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_long_1img_4xa100.sh" \
+  "${_args[@]}" \
+  "$@"

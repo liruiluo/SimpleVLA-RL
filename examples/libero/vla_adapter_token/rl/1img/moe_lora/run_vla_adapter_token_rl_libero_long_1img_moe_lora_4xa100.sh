@@ -2,11 +2,12 @@
 set -euo pipefail
 set -x
 
-# 4xGPU single-node launcher for VLA-Adapter token RL using MoE-LoRA on LIBERO (libero_goal, 1-image checkpoint).
-# Thin wrapper around `examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_goal_1img_moe_lora.sh`.
+# 4xGPU single-node launcher for VLA-Adapter token RL using MoE-LoRA on LIBERO (libero_long, 1-image checkpoint).
+# Thin wrapper around `examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_long_1img_moe_lora.sh`.
 #
 # Usage:
-#   SFT_MODEL_PATH=/abs/path/to/goal_1img_ckpt bash examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_goal_1img_moe_lora_4xa100.sh
+#   SFT_MODEL_PATH=/abs/path/to/long_1img_ckpt bash examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_long_1img_moe_lora_4xa100.sh
+#   DATASET_NAME=libero_90 bash ..._moe_lora_4xa100.sh
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -43,7 +44,7 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # Ray memory knobs (avoid extra background processes).
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_goal_1img_moe_lora.sh" \
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/moe_lora/run_vla_adapter_token_rl_libero_long_1img_moe_lora.sh" \
   data.val_batch_size=64 \
   actor_rollout_ref.rollout.micro_batch_size=4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \

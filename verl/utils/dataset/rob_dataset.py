@@ -15,6 +15,7 @@
 from omegaconf import ListConfig
 import os
 from typing import List, Union
+from typing import Optional
 
 import pandas as pd
 
@@ -100,11 +101,13 @@ class LIBERO_Dataset(Dataset):
                  task_suite_name,
                  num_trials_per_task=50,
                  train_val ="train",
+                 task_ids: Optional[List[int]] = None,
                  ):
         
         self.task_suite_name = task_suite_name  
         self.num_trials_per_task = num_trials_per_task  
         self.train_val = train_val
+        self.task_ids = task_ids
         self._read_files_and_tokenize()
 
     def _read_files_and_tokenize(self):
@@ -124,9 +127,20 @@ class LIBERO_Dataset(Dataset):
             task_suite = benchmark_dict[self.task_suite_name]()
         num_tasks_in_suite = task_suite.n_tasks
         dataframes = []
+
+        task_ids = self.task_ids
+        if task_ids is None:
+            task_ids = list(range(num_tasks_in_suite))
+        else:
+            task_ids = [int(x) for x in task_ids]
+            for tid in task_ids:
+                if not (0 <= tid < num_tasks_in_suite):
+                    raise ValueError(
+                        f"Invalid task_id={tid} for suite={self.task_suite_name} with n_tasks={num_tasks_in_suite}"
+                    )
         
         if self.task_suite_name in ["libero_10", "libero_90", "libero_goal",  "libero_object",  "libero_spatial"]:
-            for task_id in range(num_tasks_in_suite):
+            for task_id in task_ids:
                 if self.train_val == "train":
                     trials_range = list(range(0, int(self.num_trials_per_task)))
                 elif self.train_val == "valid":
