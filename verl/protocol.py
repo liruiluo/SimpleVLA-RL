@@ -121,7 +121,17 @@ class DataProto:
 
     def slice(self, index):
         tensor_data = self.batch[index]
-        non_tensor_data = {key: val[index] for key, val in self.non_tensor_batch.items()}
+
+        # `non_tensor_batch` stores numpy arrays, but callers may pass torch indices/masks
+        # (sometimes on CUDA). Normalize them to numpy-compatible indices.
+        numpy_index = index
+        if isinstance(index, torch.Tensor):
+            if index.ndim == 0:
+                numpy_index = int(index.detach().cpu().item())
+            else:
+                numpy_index = index.detach().cpu().numpy()
+
+        non_tensor_data = {key: val[numpy_index] for key, val in self.non_tensor_batch.items()}
         return DataProto(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
 
     def slice_batch(self, start, length, dim=0):

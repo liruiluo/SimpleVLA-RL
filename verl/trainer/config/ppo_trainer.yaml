@@ -35,6 +35,14 @@ actor_rollout_ref:
     enable_gradient_checkpointing: False
     use_remove_padding: False
     lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
+    # If True, use VLA-Adapter's MoE-LoRA (PEFT LoRA + token-level router per injected Linear).
+    # NOTE: MoE-LoRA is only intended for `vla-adapter-token` checkpoints where `prismatic/` is available
+    # via `VLA_ADAPTER_REPO_PATH` / `model.vla_adapter_repo_path`.
+    use_moe_lora: False
+    moe_num_experts: 3
+    moe_top_k: 2
+    # Default to the same target_modules as standard LoRA unless overridden.
+    moe_target_modules: ${actor_rollout_ref.model.target_modules}
     # If True, try to load a PEFT adapter from the checkpoint directory (e.g. `lora_adapter/`).
     # If False, create a fresh LoRA adapter (base weights stay unchanged).
     # For VLA-Adapter exported checkpoints, LoRA is commonly merged into `model.safetensors`, so default to False

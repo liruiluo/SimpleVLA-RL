@@ -2,11 +2,17 @@
 set -euo pipefail
 set -x
 
-# 1-image launcher for LIBERO-Long VLA-Adapter token RL/eval.
+# 1-image launcher for LIBERO-Long VLA-Adapter token RL using MoE-LoRA.
 # Placeholder: set `SFT_MODEL_PATH=/path/to/long_1img_ckpt` before running.
 #
 # Note: VLA-Adapter uses "LIBERO-Long" naming; in SimpleVLA-RL the task suites are typically `libero_10`/`libero_90`.
 # If needed, override `DATASET_NAME` at runtime.
+#
+# Usage:
+#   SFT_MODEL_PATH=/abs/path/to/long_1img_ckpt bash examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_long_1img_moe_lora.sh
+#   DATASET_NAME=libero_90 bash ..._moe_lora.sh
+#   # override rank if needed:
+#   bash ..._moe_lora.sh actor_rollout_ref.model.lora_rank=16
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -38,7 +44,7 @@ export SFT_MODEL_PATH
 DATASET_NAME="${DATASET_NAME:-libero_10}"
 export DATASET_NAME
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_long_vla_adapter_token_rl_1img}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_long_vla_adapter_token_moe_lora_rl_1img}"
 export EXPERIMENT_NAME
 
 if [ ! -d "$SFT_MODEL_PATH" ]; then
@@ -48,4 +54,14 @@ if [ ! -d "$SFT_MODEL_PATH" ]; then
     exit 2
 fi
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"
+# MoE-LoRA knobs.
+MOE_NUM_EXPERTS="${MOE_NUM_EXPERTS:-3}"
+MOE_TOP_K="${MOE_TOP_K:-2}"
+
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" \
+  actor_rollout_ref.model.use_moe_lora=True \
+  actor_rollout_ref.model.moe_num_experts="${MOE_NUM_EXPERTS}" \
+  actor_rollout_ref.model.moe_top_k="${MOE_TOP_K}" \
+  actor_rollout_ref.model.lora_rank=64 \
+  actor_rollout_ref.model.lora_load_from_checkpoint=False \
+  "$@"

@@ -2,13 +2,13 @@
 set -euo pipefail
 set -x
 
-# 4xGPU single-node launcher for VLA-Adapter token RL on LIBERO (libero_goal, 1-image checkpoint).
-# Thin wrapper around `examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_goal_1img.sh`.
+# 4xGPU single-node launcher for VLA-Adapter token RL on LIBERO (libero_long, 1-image checkpoint).
+# Thin wrapper around `examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_long_1img.sh`.
 #
 # Usage:
-#   bash examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_goal_1img_4xa100.sh
+#   bash examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_long_1img_4xa100.sh
 #   # optional: pass extra Hydra overrides at the end
-#   bash examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_goal_1img_4xa100.sh trainer.total_steps=230
+#   bash examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_long_1img_4xa100.sh trainer.total_steps=230
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -45,7 +45,7 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # Ray memory knobs (avoid extra background processes).
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_goal_1img.sh" \
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/lora/run_vla_adapter_token_rl_libero_long_1img.sh" \
   trainer.save_freq=-1 \
   trainer.test_freq=-1 \
   data.val_batch_size=64 \
@@ -56,4 +56,3 @@ bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
   actor_rollout_ref.ref.fsdp_config.param_offload=False \
   "$@"
-

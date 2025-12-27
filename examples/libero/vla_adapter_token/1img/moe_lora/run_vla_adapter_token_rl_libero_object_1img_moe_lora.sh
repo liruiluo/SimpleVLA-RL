@@ -2,8 +2,14 @@
 set -euo pipefail
 set -x
 
-# 1-image launcher for LIBERO-Object VLA-Adapter token RL/eval.
-# Defaults to the 1img libero_object checkpoint; pass extra Hydra overrides as "$@".
+# 1-image launcher for LIBERO-Object VLA-Adapter token RL using MoE-LoRA.
+# This wraps `examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh`.
+#
+# Usage:
+#   bash examples/libero/vla_adapter_token/1img/moe_lora/run_vla_adapter_token_rl_libero_object_1img_moe_lora.sh
+#   MOE_NUM_EXPERTS=3 MOE_TOP_K=2 bash ..._moe_lora.sh
+#   # override rank if needed:
+#   bash ..._moe_lora.sh actor_rollout_ref.model.lora_rank=16
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -34,7 +40,7 @@ export SFT_MODEL_PATH
 DATASET_NAME="${DATASET_NAME:-libero_object}"
 export DATASET_NAME
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_object_vla_adapter_token_rl_1img}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_object_vla_adapter_token_moe_lora_rl_1img}"
 export EXPERIMENT_NAME
 
 if [ ! -d "$SFT_MODEL_PATH" ]; then
@@ -42,4 +48,14 @@ if [ ! -d "$SFT_MODEL_PATH" ]; then
     exit 2
 fi
 
-bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"
+# MoE-LoRA knobs.
+MOE_NUM_EXPERTS="${MOE_NUM_EXPERTS:-3}"
+MOE_TOP_K="${MOE_TOP_K:-2}"
+
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" \
+  actor_rollout_ref.model.use_moe_lora=True \
+  actor_rollout_ref.model.moe_num_experts="${MOE_NUM_EXPERTS}" \
+  actor_rollout_ref.model.moe_top_k="${MOE_TOP_K}" \
+  actor_rollout_ref.model.lora_rank=64 \
+  actor_rollout_ref.model.lora_load_from_checkpoint=False \
+  "$@"

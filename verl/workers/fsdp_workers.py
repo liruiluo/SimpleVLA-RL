@@ -292,6 +292,10 @@ class RobActorRolloutRefWorker(Worker):
                 actor_module.gradient_checkpointing_enable()
             # lora add
             if self._is_lora:
+                use_moe_lora = False
+                if hasattr(self.config.model, "get"):
+                    use_moe_lora = bool(self.config.model.get("use_moe_lora", False))
+
                 lora_load_from_checkpoint = True
                 if hasattr(self.config.model, "get"):
                     lora_load_from_checkpoint = bool(self.config.model.get("lora_load_from_checkpoint", True))
@@ -299,41 +303,91 @@ class RobActorRolloutRefWorker(Worker):
                 # Actor has optimizer; rollout/ref don't.
                 lora_is_trainable = optim_config is not None
 
-                adapter_dir = None
-                if lora_load_from_checkpoint:
-                    adapter_dir = find_peft_adapter_dir(local_path)
-                    if adapter_dir is None:
-                        raise FileNotFoundError(
-                            "LoRA is enabled but no adapter was found in the checkpoint. "
-                            "Expected `adapter_config.json` in either:\n"
-                            f"  - {os.path.join(local_path, 'lora_adapter')}\n"
-                            f"  - {local_path}\n"
-                            "If you want to train a fresh adapter, set `model.lora_load_from_checkpoint=False`."
+                if use_moe_lora:
+                    if self.config.model.vla != "vla-adapter-token":
+                        raise ValueError("MoE-LoRA is only supported for `vla-adapter-token` in this repo.")
+                    if self.config.model.lora_rank <= 0:
+                        raise ValueError("MoE-LoRA requires `model.lora_rank > 0` (rank per expert).")
+                    if lora_load_from_checkpoint:
+                        raise NotImplementedError(
+                            "MoE-LoRA checkpoint loading is not supported in SimpleVLA-RL yet. "
+                            "Set `model.lora_load_from_checkpoint=False` to start a fresh MoE-LoRA adapter."
                         )
 
-                    print(f"Loading LoRA adapter from checkpoint: {adapter_dir} (trainable={lora_is_trainable})")
-                    actor_module = PeftModel.from_pretrained(actor_module, adapter_dir, is_trainable=lora_is_trainable)
-                    if lora_is_trainable:
-                        actor_module.print_trainable_parameters()
-                    else:
-                        actor_module.requires_grad_(False)
-                else:
-                    print("Applying fresh LoRA to actor module")
-                    lora_config = {
-                        'r': self.config.model.lora_rank,
-                        'lora_alpha': self.config.model.lora_alpha,
-                        "lora_dropout": 0,
-                        'target_modules': convert_to_regular_types(self.config.model.target_modules),
-                        # Keep initial delta ~0 so the policy behavior matches the loaded checkpoint before RL updates.
-                        'init_lora_weights': True,
-                    }
-                    actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                    moe_num_experts = int(getattr(self.config.model, "moe_num_experts", 0) or 0)
+                    moe_top_k = int(getattr(self.config.model, "moe_top_k", 0) or 0)
+                    if moe_num_experts <= 0:
+                        raise ValueError("MoE-LoRA requires `model.moe_num_experts > 0`.")
+                    if not (0 < moe_top_k < moe_num_experts):
+                        raise ValueError(
+                            f"MoE-LoRA requires `0 < moe_top_k < moe_num_experts`, got moe_top_k={moe_top_k} moe_num_experts={moe_num_experts}"
+                        )
+
+                    moe_target_modules = None
+                    if hasattr(self.config.model, "get"):
+                        moe_target_modules = self.config.model.get("moe_target_modules", None)
+                    if moe_target_modules is None:
+                        moe_target_modules = getattr(self.config.model, "target_modules", "all-linear")
+
+                    print(
+                        f"Applying fresh MoE-LoRA to actor module (experts={moe_num_experts}, top_k={moe_top_k}, r={self.config.model.lora_rank})"
+                    )
+                    actor_module.requires_grad_(False)
+
+                    # Reuse VLA-Adapter's reference implementation (requires `prismatic/` from VLA-Adapter).
+                    from prismatic.util.moe_lora import apply_moe_lora  # type: ignore
+
+                    actor_module = apply_moe_lora(
+                        actor_module,
+                        num_experts=moe_num_experts,
+                        r=int(self.config.model.lora_rank),
+                        lora_alpha=float(getattr(self.config.model, "lora_alpha", 32)),
+                        lora_dropout=0.0,
+                        top_k=moe_top_k,
+                        target_modules=convert_to_regular_types(moe_target_modules),
+                    )
                     if lora_is_trainable:
                         actor_module.print_trainable_parameters()
                     else:
                         actor_module.requires_grad_(False)
 
-                actor_module.to(torch_dtype)
+                    actor_module.to(torch_dtype)
+                else:
+                    adapter_dir = None
+                    if lora_load_from_checkpoint:
+                        adapter_dir = find_peft_adapter_dir(local_path)
+                        if adapter_dir is None:
+                            raise FileNotFoundError(
+                                "LoRA is enabled but no adapter was found in the checkpoint. "
+                                "Expected `adapter_config.json` in either:\n"
+                                f"  - {os.path.join(local_path, 'lora_adapter')}\n"
+                                f"  - {local_path}\n"
+                                "If you want to train a fresh adapter, set `model.lora_load_from_checkpoint=False`."
+                            )
+
+                        print(f"Loading LoRA adapter from checkpoint: {adapter_dir} (trainable={lora_is_trainable})")
+                        actor_module = PeftModel.from_pretrained(actor_module, adapter_dir, is_trainable=lora_is_trainable)
+                        if lora_is_trainable:
+                            actor_module.print_trainable_parameters()
+                        else:
+                            actor_module.requires_grad_(False)
+                    else:
+                        print("Applying fresh LoRA to actor module")
+                        lora_config = {
+                            'r': self.config.model.lora_rank,
+                            'lora_alpha': self.config.model.lora_alpha,
+                            "lora_dropout": 0,
+                            'target_modules': convert_to_regular_types(self.config.model.target_modules),
+                            # Keep initial delta ~0 so the policy behavior matches the loaded checkpoint before RL updates.
+                            'init_lora_weights': True,
+                        }
+                        actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                        if lora_is_trainable:
+                            actor_module.print_trainable_parameters()
+                        else:
+                            actor_module.requires_grad_(False)
+
+                    actor_module.to(torch_dtype)
             # lora end
                 
                 
@@ -722,6 +776,10 @@ class RobActorRolloutRefWorker(Worker):
 
         #lora add
         if self._is_lora and isinstance(self.actor_module, PeftModel):
+            use_moe_lora = False
+            if hasattr(self.config.model, "get"):
+                use_moe_lora = bool(self.config.model.get("use_moe_lora", False))
+
             if dist.get_rank() == 0:
                 os.makedirs(local_path, exist_ok=True)
 
@@ -731,37 +789,88 @@ class RobActorRolloutRefWorker(Worker):
                 with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False, offload_to_cpu=True):
                     if dist.get_rank() == 0:
                         from typing import OrderedDict
-                        lora_params = OrderedDict()
-                        model = self.actor_module_fsdp._fsdp_wrapped_module.base_model.model
-                        for name, param in model.named_parameters():
-                            if ".lora_" in name:
-                                name = "base_model.model." + name.replace("._fsdp_wrapped_module.", ".")
-                                lora_params[name] = param
-                        self.actor_module_fsdp.save_pretrained(
-                            lora_save_path,
-                            state_dict=lora_params,
-                            safe_serialization=True
-                        )
+                        if use_moe_lora:
+                            # PEFT's `save_pretrained()` only saves keys containing "lora_", which would drop the
+                            # MoE router weights (`.gate.weight`). Save a plain trainable state_dict instead.
+                            moe_params = OrderedDict()
+                            model = self.actor_module_fsdp._fsdp_wrapped_module.base_model.model
+                            for name, param in model.named_parameters():
+                                if param.requires_grad:
+                                    name = "base_model.model." + name.replace("._fsdp_wrapped_module.", ".")
+                                    moe_params[name] = param
+                            torch.save(moe_params, os.path.join(local_path, "moe_lora_trainable.pt"))
+                            with open(os.path.join(local_path, "moe_lora_meta.json"), "w", encoding="utf-8") as f:
+                                json.dump(
+                                    {
+                                        "moe_num_experts": int(getattr(self.config.model, "moe_num_experts", 0) or 0),
+                                        "moe_top_k": int(getattr(self.config.model, "moe_top_k", 0) or 0),
+                                        "lora_rank": int(getattr(self.config.model, "lora_rank", 0) or 0),
+                                        "lora_alpha": float(getattr(self.config.model, "lora_alpha", 0) or 0),
+                                        "target_modules": convert_to_regular_types(getattr(self.config.model, "moe_target_modules", None)),
+                                    },
+                                    f,
+                                    indent=2,
+                                )
+                        else:
+                            lora_params = OrderedDict()
+                            model = self.actor_module_fsdp._fsdp_wrapped_module.base_model.model
+                            for name, param in model.named_parameters():
+                                if ".lora_" in name:
+                                    name = "base_model.model." + name.replace("._fsdp_wrapped_module.", ".")
+                                    lora_params[name] = param
+                            self.actor_module_fsdp.save_pretrained(
+                                lora_save_path,
+                                state_dict=lora_params,
+                                safe_serialization=True
+                            )
             else:
-                self.actor_module.save_pretrained(lora_save_path, safe_serialization=True)
+                if use_moe_lora:
+                    if dist.get_rank() == 0:
+                        # Same rationale as above: keep router weights by storing the trainable state dict.
+                        model = self.actor_module.base_model.model
+                        moe_params = {k: v for k, v in model.state_dict().items() if k.endswith(".weight") or k.endswith(".bias")}
+                        # Filter to trainable params only (gate + lora A/B).
+                        trainable = {}
+                        for n, p in model.named_parameters():
+                            if p.requires_grad:
+                                trainable[n] = p.detach().cpu()
+                        torch.save(trainable, os.path.join(local_path, "moe_lora_trainable.pt"))
+                        with open(os.path.join(local_path, "moe_lora_meta.json"), "w", encoding="utf-8") as f:
+                            json.dump(
+                                {
+                                    "moe_num_experts": int(getattr(self.config.model, "moe_num_experts", 0) or 0),
+                                    "moe_top_k": int(getattr(self.config.model, "moe_top_k", 0) or 0),
+                                    "lora_rank": int(getattr(self.config.model, "lora_rank", 0) or 0),
+                                    "lora_alpha": float(getattr(self.config.model, "lora_alpha", 0) or 0),
+                                    "target_modules": convert_to_regular_types(getattr(self.config.model, "moe_target_modules", None)),
+                                },
+                                f,
+                                indent=2,
+                            )
+                else:
+                    self.actor_module.save_pretrained(lora_save_path, safe_serialization=True)
 
             dist.barrier()
             if dist.get_rank() == 0:
-                print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}")
+                if use_moe_lora:
+                    print(f"[rank-{self.rank}]: Saved MoE-LoRA trainable weights to: {os.path.join(local_path, 'moe_lora_trainable.pt')}")
+                else:
+                    print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}")
             
-            # save total model
-            base_vla = AutoModelForVision2Seq.from_pretrained(
-                self.config.model.path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True, device_map="cpu"
-            )
-            merged_vla = PeftModel.from_pretrained(base_vla, lora_save_path)
-            merged_vla = merged_vla.merge_and_unload()
+            if not use_moe_lora:
+                # save total model
+                base_vla = AutoModelForVision2Seq.from_pretrained(
+                    self.config.model.path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True, device_map="cpu"
+                )
+                merged_vla = PeftModel.from_pretrained(base_vla, lora_save_path)
+                merged_vla = merged_vla.merge_and_unload()
 
-            if dist.get_rank() == 0:
-                merged_vla.save_pretrained(local_path)
-                print(f"Saved merged model at: {local_path}")
+                if dist.get_rank() == 0:
+                    merged_vla.save_pretrained(local_path)
+                    print(f"Saved merged model at: {local_path}")
 
-            # Wait for merged model to be saved
-            dist.barrier()    
+                # Wait for merged model to be saved
+                dist.barrier()
                 
         
         # TODO: support DCP and save sharded checkpoints

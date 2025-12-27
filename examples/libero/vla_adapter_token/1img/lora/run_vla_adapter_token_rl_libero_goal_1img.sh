@@ -1,0 +1,48 @@
+#!/bin/bash
+set -euo pipefail
+set -x
+
+# 1-image launcher for LIBERO-Goal VLA-Adapter token RL/eval.
+# Placeholder: set `SFT_MODEL_PATH=/path/to/goal_1img_ckpt` before running.
+
+# Determine repo root.
+if [ -z "${REPO_ROOT:-}" ]; then
+    if [ -d "$PWD/verl" ] && [ -d "$PWD/examples" ]; then
+        REPO_ROOT="$PWD"
+    elif [ -d "$PWD/../verl" ] && [ -d "$PWD/../examples" ]; then
+        REPO_ROOT="$(cd "$PWD/.." && pwd)"
+    else
+        _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        _probe="$_script_dir"
+        while [ "$_probe" != "/" ]; do
+            if [ -d "$_probe/verl" ] && [ -d "$_probe/examples" ]; then
+                REPO_ROOT="$_probe"
+                break
+            fi
+            _probe="$(dirname "$_probe")"
+        done
+        if [ -z "${REPO_ROOT:-}" ]; then
+            echo "ERROR: cannot find repo root (missing verl/ and examples/)." >&2
+            exit 2
+        fi
+    fi
+fi
+
+# TODO: replace with the actual goal 1img ckpt path once available.
+SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/TODO-goal-1img-ckpt}"
+export SFT_MODEL_PATH
+
+DATASET_NAME="${DATASET_NAME:-libero_goal}"
+export DATASET_NAME
+
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-libero_goal_vla_adapter_token_rl_1img}"
+export EXPERIMENT_NAME
+
+if [ ! -d "$SFT_MODEL_PATH" ]; then
+    echo "ERROR: goal 1img checkpoint not found: $SFT_MODEL_PATH" >&2
+    echo "Set it via: SFT_MODEL_PATH=/abs/path/to/goal_1img_ckpt bash $0 ..." >&2
+    exit 2
+fi
+
+bash "${REPO_ROOT}/examples/libero/vla_adapter_token/1img/run_vla_adapter_token_rl_libero_1img.sh" "$@"
+
