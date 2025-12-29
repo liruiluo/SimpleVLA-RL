@@ -140,7 +140,29 @@ class RobActorRolloutRefWorker(Worker):
         from torch import optim
 
         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
-        local_path = copy_local_path_from_hdfs(model_path)
+        checkpoint_local_path = copy_local_path_from_hdfs(model_path)
+        local_path = checkpoint_local_path
+        adapter_checkpoint_path = checkpoint_local_path
+
+        # Adapter-only checkpoint support:
+        # - save_checkpoint can store only `lora_adapter/` plus a pointer to the base model.
+        # - When `base_model_ref.json` exists, we load the base model from `base_model_path` and then
+        #   load the adapter from the (original) checkpoint directory.
+        base_model_ref_path = os.path.join(checkpoint_local_path, "base_model_ref.json")
+        if os.path.isfile(base_model_ref_path):
+            try:
+                with open(base_model_ref_path, "r", encoding="utf-8") as f:
+                    ref = json.load(f)
+                base_model_path = (ref.get("base_model_path") or "").strip()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to read adapter-only checkpoint reference: {base_model_ref_path}"
+                ) from e
+            if not base_model_path:
+                raise ValueError(
+                    f"Invalid adapter-only checkpoint reference (missing base_model_path): {base_model_ref_path}"
+                )
+            local_path = copy_local_path_from_hdfs(base_model_path)
         #add oft
          
         if self.config.model.vla == "vla-adapter-token":
@@ -355,13 +377,13 @@ class RobActorRolloutRefWorker(Worker):
                 else:
                     adapter_dir = None
                     if lora_load_from_checkpoint:
-                        adapter_dir = find_peft_adapter_dir(local_path)
+                        adapter_dir = find_peft_adapter_dir(adapter_checkpoint_path)
                         if adapter_dir is None:
                             raise FileNotFoundError(
                                 "LoRA is enabled but no adapter was found in the checkpoint. "
                                 "Expected `adapter_config.json` in either:\n"
-                                f"  - {os.path.join(local_path, 'lora_adapter')}\n"
-                                f"  - {local_path}\n"
+                                f"  - {os.path.join(adapter_checkpoint_path, 'lora_adapter')}\n"
+                                f"  - {adapter_checkpoint_path}\n"
                                 "If you want to train a fresh adapter, set `model.lora_load_from_checkpoint=False`."
                             )
 
@@ -784,6 +806,9 @@ class RobActorRolloutRefWorker(Worker):
                 os.makedirs(local_path, exist_ok=True)
 
             lora_save_path = os.path.join(local_path, "lora_adapter")
+            save_merged_model = True
+            if hasattr(self.config.model, "get"):
+                save_merged_model = bool(self.config.model.get("save_merged_model", True))
 
             if isinstance(self.actor_module_fsdp, FSDP):
                 with FSDP.summon_full_params(self.actor_module_fsdp, writeback=False, offload_to_cpu=True):
@@ -857,10 +882,14 @@ class RobActorRolloutRefWorker(Worker):
                 else:
                     print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}")
             
-            if not use_moe_lora:
+            if not use_moe_lora and save_merged_model:
                 # save total model
-                base_vla = AutoModelForVision2Seq.from_pretrained(
-                    self.config.model.path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True, device_map="cpu"
+                base_vla = transformers.AutoModelForVision2Seq.from_pretrained(
+                    self.config.model.path,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                    device_map="cpu",
                 )
                 merged_vla = PeftModel.from_pretrained(base_vla, lora_save_path)
                 merged_vla = merged_vla.merge_and_unload()
@@ -870,6 +899,14 @@ class RobActorRolloutRefWorker(Worker):
                     print(f"Saved merged model at: {local_path}")
 
                 # Wait for merged model to be saved
+                dist.barrier()
+            elif not use_moe_lora and not save_merged_model:
+                if dist.get_rank() == 0:
+                    with open(os.path.join(local_path, "base_model_ref.json"), "w", encoding="utf-8") as f:
+                        json.dump({"base_model_path": str(self.config.model.path)}, f, indent=2)
+                    print(
+                        f"[rank-{self.rank}]: Saved adapter-only checkpoint (base_model_ref.json + lora_adapter/) at: {local_path}"
+                    )
                 dist.barrier()
                 
         

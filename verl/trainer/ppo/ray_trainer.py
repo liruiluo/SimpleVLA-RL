@@ -508,12 +508,35 @@ class RayTrainer(object):
 
         use_crl = bool(getattr(self.config.data, "use_crl", False))
         crl_eval_on_switch = bool(self.config.trainer.get("crl_eval_on_switch", False))
+        crl_save_on_switch = bool(self.config.trainer.get("crl_save_on_switch", False))
         crl_task_ids: list[int] | None = None
         crl_steps_per_task: int | None = None
         crl_task_idx = 0
         crl_next_switch_step: int | None = None
         crl_current_task_id: int | None = None
         crl_success_after_train: dict[int, float] = {}
+        crl_ckpt_saved_at_step: dict[int, int] = {}
+
+        def _save_crl_checkpoints(task_id: int, step: int) -> None:
+            if not crl_save_on_switch:
+                return
+            task_id = int(task_id)
+            step = int(step)
+            if task_id in crl_ckpt_saved_at_step:
+                return
+
+            tag = f"task_{task_id}"
+            base_dir = os.path.join(self.config.trainer.default_local_dir, "crl", tag)
+            actor_local_path = os.path.join(base_dir, "actor", f"global_step_{step}")
+            self.actor_rollout_wg.save_checkpoint(actor_local_path, None)
+            if self.use_critic:
+                critic_local_path = os.path.join(base_dir, "critic", f"global_step_{step}")
+                self.critic_wg.save_checkpoint(critic_local_path, None)
+            if self.use_rm:
+                prm_local_path = os.path.join(base_dir, "prm", f"global_step_{step}")
+                self.rm_wg.save_checkpoint(prm_local_path, None)
+            crl_ckpt_saved_at_step[task_id] = step
+            print(f"[CRL] Saved checkpoints for {tag} at global_step={step}")
 
         if use_crl:
             if "libero" not in self.config.data.task_suite_name:
@@ -816,6 +839,9 @@ class RayTrainer(object):
                         )
                         print(f"[CRL] task_id={crl_current_task_id} success_after_train={task_success:.4f}")
 
+                    if crl_current_task_id is not None and global_steps >= crl_next_switch_step:
+                        _save_crl_checkpoints(task_id=int(crl_current_task_id), step=int(global_steps))
+
                     if (target_steps is None or global_steps < target_steps) and global_steps >= crl_next_switch_step and (crl_task_idx + 1) < len(crl_task_ids):
                         crl_task_idx += 1
                         next_task_id = int(crl_task_ids[crl_task_idx])
@@ -853,6 +879,9 @@ class RayTrainer(object):
                 mean_success = float(np.mean([crl_success_after_train[t] for t in ordered]))
                 logger.log(data={"crl/mean_success_after_train": mean_success}, step=global_steps)
                 print(f"[CRL] mean_success_after_train={mean_success:.4f} over task_ids={ordered}")
+
+        if use_crl and crl_current_task_id is not None:
+            _save_crl_checkpoints(task_id=int(crl_current_task_id), step=int(global_steps))
 
     def filter_format(self, reward_tensor, batch, n_samples):
         """
