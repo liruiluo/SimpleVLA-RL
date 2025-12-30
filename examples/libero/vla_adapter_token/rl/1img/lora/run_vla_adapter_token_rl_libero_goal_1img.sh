@@ -3,7 +3,8 @@ set -euo pipefail
 set -x
 
 # 1-image launcher for LIBERO-Goal VLA-Adapter token RL/eval.
-# Placeholder: set `SFT_MODEL_PATH=/path/to/goal_1img_ckpt` before running.
+# You can override the checkpoint via:
+#   SFT_MODEL_PATH=/abs/path/to/goal_1img_ckpt bash examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_goal_1img.sh
 
 # Determine repo root.
 if [ -z "${REPO_ROOT:-}" ]; then
@@ -28,8 +29,8 @@ if [ -z "${REPO_ROOT:-}" ]; then
     fi
 fi
 
-# TODO: replace with the actual goal 1img ckpt path once available.
-SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/TODO-goal-1img-ckpt}"
+# Default to the included goal 1-image checkpoint (override via env var if needed).
+SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/configs+libero_goal_no_noops+b64+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--token--1img--libero_goal_no_noops--2025-12-29_13-38-52--25000_chkpt}"
 export SFT_MODEL_PATH
 
 DATASET_NAME="${DATASET_NAME:-libero_goal}"

@@ -33,6 +33,10 @@ if [ -z "${REPO_ROOT:-}" ]; then
     fi
 fi
 
+# Default to the included goal 1-image checkpoint (override via env var if needed).
+SFT_MODEL_PATH="${SFT_MODEL_PATH:-${REPO_ROOT}/models/token-1img/configs+libero_goal_no_noops+b64+lr-0.0002+lora-r64+dropout-0.0--image_aug--VLA-Adapter--token--1img--libero_goal_no_noops--2025-12-29_13-38-52--25000_chkpt}"
+export SFT_MODEL_PATH
+
 # ---- GPU layout ----
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NUM_GPUS="${NUM_GPUS:-4}"
