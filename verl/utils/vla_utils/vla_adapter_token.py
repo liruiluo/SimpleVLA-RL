@@ -98,12 +98,48 @@ def lm_head_logits_subset(lm_head: torch.nn.Module, hidden_states: torch.Tensor,
     # (so dtype / rounding match the underlying kernels), then cast to fp32 at the end.
     base_layer = lm_head.base_layer if hasattr(lm_head, "base_layer") else lm_head
 
-    weight_slice = base_layer.weight[start_token:end_token]
-    bias = getattr(base_layer, "bias", None)
-    bias_slice = bias[start_token:end_token] if bias is not None else None
+    width = int(end_token) - int(start_token)
+    if width <= 0:
+        raise ValueError(f"Invalid vocab slice [{start_token}:{end_token}); width must be > 0.")
 
-    # Base projection (same dtype as base_layer forward).
-    result = F.linear(hidden_states, weight_slice, bias_slice)
+    # NOTE: Avoid `param[start:end]` views under FSDP. Those can reference ephemeral unsharded storage that gets
+    # freed before backward, leading to "storage size 0" / setStorage errors.
+    #
+    # Additionally, some checkpoints/configs may have `action_vocab_size` slightly larger than the actual
+    # `lm_head` rows (e.g., after tokenizer resize). Python slicing would silently clamp; `index_select` would
+    # hard-error (device-side assert). We emulate "take the last `width` rows up to `end_token`", clamped to
+    # the real weight size.
+    weight_rows = int(base_layer.weight.size(0))
+    effective_end = min(int(end_token), weight_rows)
+    effective_start = effective_end - width
+    if effective_start < 0:
+        effective_start = max(0, weight_rows - width)
+        effective_end = effective_start + width
+
+    if not (0 <= effective_start < effective_end <= weight_rows) or (effective_end - effective_start) != width:
+        raise RuntimeError(
+            f"Cannot slice lm_head rows safely: requested=[{start_token}:{end_token}) width={width}, "
+            f"weight_rows={weight_rows}, effective=[{effective_start}:{effective_end})."
+        )
+
+    token_idx = torch.arange(effective_start, effective_end, device=base_layer.weight.device, dtype=torch.long)
+    weight_slice = torch.index_select(base_layer.weight, dim=0, index=token_idx)
+    bias = getattr(base_layer, "bias", None)
+    bias_slice = torch.index_select(bias, dim=0, index=token_idx) if bias is not None else None
+
+    # Most RL runs in this repo fine-tune LoRA adapters only; base model weights are frozen.
+    # If the base lm_head weights are frozen, detach the gathered slice to avoid running autograd
+    # (index_select backward) through FSDP-managed sharded parameters.
+    if not bool(getattr(base_layer.weight, "requires_grad", False)):
+        weight_slice = weight_slice.detach()
+        if bias_slice is not None:
+            bias_slice = bias_slice.detach()
+
+    # Base projection (match base_layer forward dtype).
+    hs = hidden_states
+    if hs.dtype != weight_slice.dtype:
+        hs = hs.to(weight_slice.dtype)
+    result = F.linear(hs, weight_slice, bias_slice)
     torch_result_dtype = result.dtype
 
     # PEFT LoRA (peft==0.11.1): result += lora_B(lora_A(dropout(x))) * scaling for each active adapter.
@@ -152,7 +188,8 @@ def lm_head_logits_subset(lm_head: torch.nn.Module, hidden_states: torch.Tensor,
             x_a = A_mod(x)
 
             # lora_B(...) but only for the vocab slice
-            B_weight = B_mod.weight[start_token:end_token]
+            idx_b = token_idx if token_idx.device == B_mod.weight.device else token_idx.to(B_mod.weight.device)
+            B_weight = torch.index_select(B_mod.weight, dim=0, index=idx_b)
             delta = F.linear(x_a, B_weight, None)
 
             # Multiply in-module dtype (PEFT uses python float scaling, which follows tensor dtype).

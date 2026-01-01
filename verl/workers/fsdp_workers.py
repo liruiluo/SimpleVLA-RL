@@ -449,11 +449,17 @@ class RobActorRolloutRefWorker(Worker):
         else:
             sharding_strategy = ShardingStrategy.FULL_SHARD
 
+        # NOTE: When using PEFT/LoRA we typically freeze most base weights and only train adapter params.
+        # FSDP with flattened params (`use_orig_params=False`) can be fragile in this mixed requires_grad setting
+        # and has been observed to trigger CUDA illegal memory access during unshard/all-gather on multi-GPU.
+        # Using original params avoids flattening and keeps per-parameter `requires_grad` semantics.
+        use_orig_params = bool(self._is_actor and self._is_lora)
+
         # TODO: add transformer policy
         actor_module_fsdp = FSDP(
             actor_module,
             param_init_fn=init_fn,
-            use_orig_params=False,
+            use_orig_params=use_orig_params,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,  # zero3
@@ -1074,11 +1080,14 @@ class ActorRolloutRefWorker(Worker):
         else:
             sharding_strategy = ShardingStrategy.FULL_SHARD
 
+        # See note above: keep original params when training with LoRA/PEFT.
+        use_orig_params = bool(self._is_actor and self._is_lora)
+
         # TODO: add transformer policy
         actor_module_fsdp = FSDP(
             actor_module,
             param_init_fn=init_fn,
-            use_orig_params=False,
+            use_orig_params=use_orig_params,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,  # zero3

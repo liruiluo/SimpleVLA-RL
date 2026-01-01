@@ -46,6 +46,7 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 
 bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_long_1img.sh" \
+  data.train_batch_size=32 \
   data.val_batch_size=64 \
   actor_rollout_ref.rollout.micro_batch_size=4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \
