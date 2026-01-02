@@ -16,7 +16,6 @@ Single Process Actor
 """
 
 import itertools
-import contextlib
 from typing import Iterable, Tuple
 
 import torch
@@ -194,64 +193,16 @@ class RobDataParallelPPOActor(BasePPOActor):
             action_logits: (B, action_token_count, 256)
             start_token: int  # token id base for the 256-bin slice
         """
-        device = action_input_ids.device
-        batch_size = action_input_ids.size(0)
-        action_token_count = int(self.config.action_token_len * self.config.action_chunks_len)
-
         module = self.actor_module
-        param_ctx = contextlib.nullcontext()
-        if isinstance(module, FSDP):
-            param_ctx = FSDP.summon_full_params(module, writeback=False, recurse=False)
-
-        with param_ctx:
-            raw = module
-            if isinstance(raw, FSDP):
-                raw = raw._fsdp_wrapped_module
-            if hasattr(raw, "get_base_model"):
-                raw = raw.get_base_model()
-
-            input_embeddings = raw.get_input_embeddings()(action_input_ids)  # (B, seq, D)
-            all_actions_mask = raw._process_action_masks(labels)
-            language_embeddings = input_embeddings[~all_actions_mask].reshape(batch_size, -1, input_embeddings.shape[2])
-
-            projected_patch_embeddings = raw._process_vision_features(pixel_values, language_embeddings, use_film=False)
-
-            action_queries = raw.action_queries.weight
-            action_queries = action_queries.view(1, action_queries.shape[0], action_queries.shape[1]).repeat(batch_size, 1, 1)
-            input_embeddings = raw._replace_input_embeddings(input_embeddings, all_actions_mask, action_queries)
-
-            multimodal_embeddings, multimodal_attention_mask = raw._build_multimodal_attention(
-                input_embeddings, projected_patch_embeddings, action_attention_mask
-            )
-
-            lm = raw.language_model
-            lm_outputs = lm.model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                use_cache=False,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-            hidden_states = lm_outputs[0]  # (B, seq_total, hidden)
-
-            num_patches = int(raw.vision_backbone.get_num_patches() * raw.vision_backbone.get_num_images_in_input())
-            start_positions = num_patches + prompt_lens.to(torch.long) - 1  # (B,)
-            positions = start_positions[:, None] + torch.arange(action_token_count, device=device)[None, :]
-            action_hidden = hidden_states[torch.arange(batch_size, device=device)[:, None], positions]  # (B, 56, hidden)
-
-            action_vocab_size = int(raw.action_vocab_size)
-            start_token = action_vocab_size - 256
-            from verl.utils.vla_utils.vla_adapter_token import lm_head_logits_subset
-            action_logits = lm_head_logits_subset(lm.lm_head, action_hidden, start_token, action_vocab_size)  # (B, 56, 256)
-
-        if temperature <= 0:
-            temperature = 1.0
-        action_logits = action_logits / float(temperature)
-        return action_logits, start_token
+        action_logits, start_token = module(
+            action_input_ids=action_input_ids,
+            action_attention_mask=action_attention_mask,
+            pixel_values=pixel_values,
+            labels=labels,
+            prompt_lens=prompt_lens,
+            temperature=temperature,
+        )
+        return action_logits, int(start_token)
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -702,7 +653,7 @@ class RobDataParallelPPOActor(BasePPOActor):
                 # split batch into micro_batches
                 micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
 
-            self.actor_optimizer.zero_grad()
+            self.actor_optimizer.zero_grad(set_to_none=True)
 
             for test_idx, data in enumerate(micro_batches):
                 data = data.cuda()  # actor device is cpu when using offload
@@ -801,7 +752,7 @@ class RobDataParallelPPOActor(BasePPOActor):
             data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)
             torch.cuda.empty_cache()
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         torch.distributed.barrier()
         torch.cuda.empty_cache()

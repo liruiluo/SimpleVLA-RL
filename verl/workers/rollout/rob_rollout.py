@@ -46,7 +46,6 @@ from verl.utils.vla_utils.openvla_oft.constants import (
 )
 import numpy as np
 from PIL import Image
-import tensorflow as tf
 from collections import deque
 import random
 import yaml
@@ -81,6 +80,7 @@ def crop_and_resize(image, crop_scale, batch_size):
     to original size. We use the same logic seen in the `dlimp` RLDS datasets wrapper to avoid
     distribution shift at test time.
     """
+    import tensorflow as tf
     assert image.shape.ndims == 3 or image.shape.ndims == 4
     expanded_dims = False
     if image.shape.ndims == 3:
@@ -110,6 +110,7 @@ def crop_and_resize(image, crop_scale, batch_size):
     return image
 
 def center_crop_image(image):
+    import tensorflow as tf
     batch_size = 1
     crop_scale = 0.9
 
@@ -359,77 +360,101 @@ def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, 
             "`VLA_ADAPTER_REPO_PATH=/path/to/VLA-Adapter` (so `${VLA_ADAPTER_REPO_PATH}/LIBERO` is importable)."
         ) from e
 
-    with filter_std_streams(noisy_substrings):
-        benchmark_dict = benchmark.get_benchmark_dict()
-        task_suite = benchmark_dict[task_name]()
-        task = task_suite.get_task(task_id)
-        initial_states = task_suite.get_task_init_states(task_id)
-        initial_state = initial_states[trial_id]
-    
-    with filter_std_streams(noisy_substrings):
-        env, task_description = get_libero_env(task, config.model_family, resolution=256)
-    
-    env.reset()
-    obs = env.set_init_state(initial_state)
-    
-    t = 0
-    valid_images = []
-    while t < config.num_steps_wait:
-        obs, _, _, _ = env.step(get_libero_dummy_action(config.model_family))
-        t += 1
-        
-    if is_valid:
-        img = obs["agentview_image"][::-1, ::-1]
-        valid_images.append(img)
-    
-    output_queue.put({
-        'type': 'init',
-        'obs': obs,
-        "task_description": task_description,
-        'valid_images': valid_images.copy(),
-        'task_file_name': f"{task_name}_task_{task_id}_trial_{trial_id}",
-        'active': True,
-        'complete': False,
-        'finish_step': 0
-    })
+    env = None
+    try:
+        with filter_std_streams(noisy_substrings):
+            benchmark_dict = benchmark.get_benchmark_dict()
+            task_suite = benchmark_dict[task_name]()
+            task = task_suite.get_task(task_id)
+            initial_states = task_suite.get_task_init_states(task_id)
+            initial_state = initial_states[trial_id]
+
+        with filter_std_streams(noisy_substrings):
+            env, task_description = get_libero_env(task, config.model_family, resolution=256)
+
+        env.reset()
+        obs = env.set_init_state(initial_state)
+
+        t = 0
+        valid_images = []
+        while t < config.num_steps_wait:
+            obs, _, _, _ = env.step(get_libero_dummy_action(config.model_family))
+            t += 1
+
+        if is_valid:
+            img = obs["agentview_image"][::-1, ::-1]
+            valid_images.append(img)
+
+        output_queue.put(
+            {
+                "type": "init",
+                "obs": obs,
+                "task_description": task_description,
+                "valid_images": valid_images.copy(),
+                "task_file_name": f"{task_name}_task_{task_id}_trial_{trial_id}",
+                "active": True,
+                "complete": False,
+                "finish_step": 0,
+            }
+        )
+    except Exception:
+        try:
+            output_queue.put({"type": "error", "stage": "init", "traceback": traceback.format_exc()})
+        finally:
+            try:
+                if env is not None:
+                    env.close()
+            except Exception:
+                pass
+        return
     
     active = True
     complete = False
     finish_step = 0
     
     while True:
-        action = input_queue.get()
-        if action is None:
-            env.close()
-            output_queue.put({'type': 'terminate'})
-            break
-        
-        step_images = []
-        for i in range(len(action)):
-            a = action[i]
-            normalized_action = normalize_gripper_action(a, binarize=True)
-            inverted_action = invert_gripper_action(normalized_action)
-            obs, reward, done, info = env.step(inverted_action.tolist())
-            
-            if is_valid:
-                img = obs["agentview_image"][::-1, ::-1]
-                step_images.append(img)
-            
-            finish_step += 1
-            if done or finish_step >= max_steps:
-                active = False
-                complete = done
+        try:
+            action = input_queue.get()
+            if action is None:
+                env.close()
+                output_queue.put({"type": "terminate"})
                 break
-        
-        output_data = {
-            'type': 'step',
-            'obs': obs,
-            'active': active,
-            'complete': complete,
-            'finish_step': finish_step,
-            'valid_images': step_images.copy() if is_valid else []
-        }
-        output_queue.put(output_data)
+
+            step_images = []
+            for i in range(len(action)):
+                a = action[i]
+                normalized_action = normalize_gripper_action(a, binarize=True)
+                inverted_action = invert_gripper_action(normalized_action)
+                obs, reward, done, info = env.step(inverted_action.tolist())
+
+                if is_valid:
+                    img = obs["agentview_image"][::-1, ::-1]
+                    step_images.append(img)
+
+                finish_step += 1
+                if done or finish_step >= max_steps:
+                    active = False
+                    complete = done
+                    break
+
+            output_data = {
+                "type": "step",
+                "obs": obs,
+                "active": active,
+                "complete": complete,
+                "finish_step": finish_step,
+                "valid_images": step_images.copy() if is_valid else [],
+            }
+            output_queue.put(output_data)
+        except Exception:
+            try:
+                output_queue.put({"type": "error", "stage": "step", "traceback": traceback.format_exc()})
+            finally:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+            break
 
 # ================ Main Rollout Class ================
 
@@ -490,6 +515,7 @@ class RobHFRollout(BaseRollout):
         
     def vla_preprocess(self):
         if self.config.vla in ["openvla", "openvla-oft"]:
+            import tensorflow as tf
             gpus = tf.config.experimental.list_physical_devices('GPU')
             if gpus:
                 for gpu in gpus:
@@ -829,6 +855,11 @@ class RobHFRollout(BaseRollout):
     def _generate_minibatch_libero(self, prompts):
         """Generate minibatch for Libero using multiprocessing"""
         self.module.eval()
+        init_timeout_s = int(os.environ.get("VERL_LIBERO_ENV_INIT_TIMEOUT_S", "300"))
+        step_timeout_s = int(os.environ.get("VERL_LIBERO_ENV_STEP_TIMEOUT_S", "300"))
+        join_timeout_s = int(os.environ.get("VERL_LIBERO_ENV_JOIN_TIMEOUT_S", "60"))
+        mp_start_method = os.environ.get("VERL_LIBERO_MP_START_METHOD", "spawn")
+        mp_ctx = multiprocessing.get_context(mp_start_method)
         meta_info = prompts.meta_info
         n_samples = meta_info.get('n_samples', 1)
         task_id = prompts.batch['task_id'].repeat_interleave(n_samples, dim=0)
@@ -847,9 +878,9 @@ class RobHFRollout(BaseRollout):
             task_name = task_suite_name[idx]
             t_id = task_id[idx][0].item()
             tr_id = trial_id[idx][0].item()
-            input_q = Queue()
-            output_q = Queue()
-            p = Process(
+            input_q = mp_ctx.Queue()
+            output_q = mp_ctx.Queue()
+            p = mp_ctx.Process(
                 target=env_worker,
                 args=(task_name, t_id, tr_id, self.config, input_q, output_q, is_valid, global_steps, max_steps)
             )
@@ -865,13 +896,20 @@ class RobHFRollout(BaseRollout):
         
         for idx in range(batch_size):
             try:
-                init_data = output_queues[idx].get(timeout=120)
+                init_data = output_queues[idx].get(timeout=init_timeout_s)
             except queue.Empty as e:
+                proc = processes[idx]
                 for p in processes:
                     p.terminate()
                 raise RuntimeError(
-                    "LIBERO env worker init timed out after 120s."
+                    f"LIBERO env worker init timed out after {init_timeout_s}s (idx={idx}, alive={proc.is_alive()}, exitcode={proc.exitcode})."
                 ) from e
+            if init_data.get("type") == "error":
+                for p in processes:
+                    p.terminate()
+                raise RuntimeError(
+                    f"LIBERO env worker failed during init (idx={idx}).\n{init_data.get('traceback','')}"
+                )
             assert init_data['type'] == 'init'
             task_descriptions.append(init_data["task_description"])
             inputs.append(self._obs_to_input(init_data['obs'], is_robotwin=False))
@@ -914,13 +952,20 @@ class RobHFRollout(BaseRollout):
             new_inputs = inputs.copy()
             for idx in active_indices:
                 try:
-                    result = output_queues[idx].get(timeout=120)
+                    result = output_queues[idx].get(timeout=step_timeout_s)
                 except queue.Empty as e:
+                    proc = processes[idx]
                     for p in processes:
                         p.terminate()
                     raise RuntimeError(
-                        "LIBERO env worker step timed out after 120s."
+                        f"LIBERO env worker step timed out after {step_timeout_s}s (idx={idx}, alive={proc.is_alive()}, exitcode={proc.exitcode})."
                     ) from e
+                if result.get("type") == "error":
+                    for p in processes:
+                        p.terminate()
+                    raise RuntimeError(
+                        f"LIBERO env worker failed during step (idx={idx}).\n{result.get('traceback','')}"
+                    )
                 assert result['type'] == 'step'
                 new_inputs[idx] = self._obs_to_input(result['obs'], is_robotwin=False)
                 task_records[idx]['active'] = result['active']
@@ -935,7 +980,7 @@ class RobHFRollout(BaseRollout):
         for q in input_queues:
             q.put(None)
         for p in processes:
-            p.join(timeout=20)
+            p.join(timeout=join_timeout_s)
             if p.is_alive():
                 p.terminate()
         

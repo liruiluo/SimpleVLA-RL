@@ -5,7 +5,7 @@ import re
 import sys
 import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -199,3 +199,97 @@ def lm_head_logits_subset(lm_head: torch.nn.Module, hidden_states: torch.Tensor,
         result = result.to(torch_result_dtype)
 
     return result.to(torch.float32)
+
+
+class VLAAdapterTokenActionLogitsWrapper(torch.nn.Module):
+    """
+    FSDP-friendly wrapper for VLA-Adapter token models.
+
+    - Default: delegates to the wrapped model's forward() (HF-compatible).
+    - Special path: when `action_input_ids` is provided, computes only action-token logits in the 256-bin
+      action vocabulary slice without materializing full-vocab logits.
+    """
+
+    def __init__(self, wrapped: torch.nn.Module, action_token_len: int, action_chunks_len: int):
+        super().__init__()
+        self.wrapped = wrapped
+        self.action_token_len = int(action_token_len)
+        self.action_chunks_len = int(action_chunks_len)
+
+    def __getattr__(self, name: str) -> Any:  # pragma: no cover
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.wrapped, name)
+
+    def forward(
+        self,
+        *args: Any,
+        action_input_ids: Optional[torch.Tensor] = None,
+        action_attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        prompt_lens: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        **kwargs: Any,
+    ) -> Any:
+        if action_input_ids is None:
+            return self.wrapped(*args, **kwargs)
+
+        if action_attention_mask is None or pixel_values is None or labels is None or prompt_lens is None:
+            raise ValueError(
+                "VLAAdapterTokenActionLogitsWrapper.forward() requires "
+                "`action_attention_mask`, `pixel_values`, `labels`, and `prompt_lens` when `action_input_ids` is set."
+            )
+
+        device = action_input_ids.device
+        batch_size = action_input_ids.size(0)
+        action_token_count = int(self.action_token_len * self.action_chunks_len)
+
+        module = self.wrapped
+        if hasattr(module, "get_base_model"):
+            module = module.get_base_model()
+
+        input_embeddings = module.get_input_embeddings()(action_input_ids)  # (B, seq, D)
+        all_actions_mask = module._process_action_masks(labels)
+        language_embeddings = input_embeddings[~all_actions_mask].reshape(batch_size, -1, input_embeddings.shape[2])
+
+        projected_patch_embeddings = module._process_vision_features(pixel_values, language_embeddings, use_film=False)
+
+        action_queries = module.action_queries.weight
+        action_queries = action_queries.view(1, action_queries.shape[0], action_queries.shape[1]).repeat(batch_size, 1, 1)
+        input_embeddings = module._replace_input_embeddings(input_embeddings, all_actions_mask, action_queries)
+
+        multimodal_embeddings, multimodal_attention_mask = module._build_multimodal_attention(
+            input_embeddings, projected_patch_embeddings, action_attention_mask
+        )
+
+        lm = module.language_model
+        lm_outputs = lm.model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=multimodal_embeddings,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        hidden_states = lm_outputs[0]  # (B, seq_total, hidden)
+
+        num_patches = int(module.vision_backbone.get_num_patches() * module.vision_backbone.get_num_images_in_input())
+        start_positions = num_patches + prompt_lens.to(torch.long) - 1  # (B,)
+        positions = start_positions[:, None] + torch.arange(action_token_count, device=device)[None, :]
+        action_hidden = hidden_states[torch.arange(batch_size, device=device)[:, None], positions]  # (B, 56, hidden)
+
+        action_vocab_size = int(module.action_vocab_size)
+        start_token = int(action_vocab_size - 256)
+        action_logits = lm_head_logits_subset(lm.lm_head, action_hidden, start_token, action_vocab_size)  # (B, 56, 256)
+
+        temperature = float(temperature)
+        if temperature <= 0:
+            temperature = 1.0
+        action_logits = action_logits / temperature
+
+        return action_logits, start_token

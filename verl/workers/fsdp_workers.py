@@ -412,6 +412,20 @@ class RobActorRolloutRefWorker(Worker):
                     actor_module.to(torch_dtype)
             # lora end
                 
+        if self.config.model.vla == "vla-adapter-token":
+            from verl.utils.vla_utils.vla_adapter_token import VLAAdapterTokenActionLogitsWrapper
+
+            action_token_len = int(getattr(self.config.model, "action_token_len", 0) or 0)
+            action_chunks_len = int(getattr(self.config.model, "action_chunks_len", 0) or 0)
+            if action_token_len <= 0 or action_chunks_len <= 0:
+                raise ValueError(
+                    f"Invalid action token config for vla-adapter-token: "
+                    f"action_token_len={action_token_len}, action_chunks_len={action_chunks_len}"
+                )
+
+            actor_module = VLAAdapterTokenActionLogitsWrapper(
+                actor_module, action_token_len=action_token_len, action_chunks_len=action_chunks_len
+            )
                 
         torch.distributed.barrier()
 
@@ -437,8 +451,22 @@ class RobActorRolloutRefWorker(Worker):
             mixed_precision = None
         
         #oft add
-        auto_wrap_policy = get_fsdp_wrap_policy_vla(module=actor_module, config=fsdp_config.get('wrap_policy', None), is_lora=self.config.model.get('lora_rank', 0) > 0)
+        auto_wrap_policy = get_fsdp_wrap_policy_vla(
+            module=actor_module,
+            config=fsdp_config.get('wrap_policy', None),
+            is_lora=self.config.model.get('lora_rank', 0) > 0,
+        )
         #oft add end
+
+        # For `vla-adapter-token` we use a custom actor forward that calls into submodules directly (to avoid
+        # full-vocab logits). Nested FSDP wrappers created by auto-wrapping can be brittle under this access
+        # pattern on multi-GPU. Prefer a single top-level FSDP wrapper for stability.
+        if (
+            self._is_actor
+            and self._is_lora
+            and getattr(self.config.model, "vla", None) == "vla-adapter-token"
+        ):
+            auto_wrap_policy = None
         
 
         print(f'wrap_policy: {auto_wrap_policy}')
@@ -448,6 +476,17 @@ class RobActorRolloutRefWorker(Worker):
             sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
         else:
             sharding_strategy = ShardingStrategy.FULL_SHARD
+
+        # `vla-adapter-token` actor update uses a custom forward path that calls into submodules directly
+        # (to avoid materializing full-vocab logits). Any sharding strategy that reshares/frees parameter
+        # storage between forward and backward can interact poorly with this access pattern and lead to
+        # "storage size 0" / shape-mismatch errors on multi-GPU. Prefer NO_SHARD (DDP-like) for stability.
+        if (
+            self._is_actor
+            and self._is_lora
+            and getattr(self.config.model, "vla", None) == "vla-adapter-token"
+        ):
+            sharding_strategy = ShardingStrategy.NO_SHARD
 
         # NOTE: When using PEFT/LoRA we typically freeze most base weights and only train adapter params.
         # FSDP with flattened params (`use_orig_params=False`) can be fragile in this mixed requires_grad setting
