@@ -72,8 +72,11 @@ class DPEngineRayWorkerGroup(RayWorkerGroup):
         for method_name in dir(engine_type):
             try:
                 is_callable = callable(getattr(engine_type, method_name))
-            except Exception as _:
-                pass
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to introspect `{engine_type}` attribute `{method_name}` while registering methods. "
+                    "This likely indicates a broken descriptor/property or an unexpected class definition."
+                ) from e
             else:
                 if is_callable and method_name not in dir(RefBasicRayActor):
                     print(f"register method: {method_name}")

@@ -32,8 +32,11 @@ __all__ = ['DataProto', 'union_tensor_dict',]
 
 try:
     tensordict.set_lazy_legacy(False).set()
-except:
-    pass
+except Exception as e:
+    raise RuntimeError(
+        "Failed to configure `tensordict` legacy/lazy mode (tensordict.set_lazy_legacy(False).set()). "
+        "This typically indicates an incompatible `tensordict` version or API mismatch."
+    ) from e
 
 
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:

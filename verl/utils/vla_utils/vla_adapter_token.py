@@ -75,7 +75,9 @@ def ensure_hf_trust_remote_code_safe_path(path: str, link_root: Optional[str] = 
     try:
         safe_path.symlink_to(original, target_is_directory=True)
     except FileExistsError:
-        pass
+        # Benign race: another process may have created the symlink between `exists()` and `symlink_to()`.
+        # Keep going, but make it visible in logs for debugging.
+        print(f"WARNING: symlink already exists for HF-safe path: {safe_path}", file=sys.stderr, flush=True)
 
     return str(safe_path)
 

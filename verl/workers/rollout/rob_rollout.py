@@ -398,14 +398,13 @@ def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, 
             }
         )
     except Exception:
+        error_payload = {"type": "error", "stage": "init", "traceback": traceback.format_exc()}
         try:
-            output_queue.put({"type": "error", "stage": "init", "traceback": traceback.format_exc()})
-        finally:
-            try:
-                if env is not None:
-                    env.close()
-            except Exception:
-                pass
+            if env is not None:
+                env.close()
+        except Exception:
+            error_payload["cleanup_traceback"] = traceback.format_exc()
+        output_queue.put(error_payload)
         return
     
     active = True
@@ -447,13 +446,12 @@ def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, 
             }
             output_queue.put(output_data)
         except Exception:
+            error_payload = {"type": "error", "stage": "step", "traceback": traceback.format_exc()}
             try:
-                output_queue.put({"type": "error", "stage": "step", "traceback": traceback.format_exc()})
-            finally:
-                try:
-                    env.close()
-                except Exception:
-                    pass
+                env.close()
+            except Exception:
+                error_payload["cleanup_traceback"] = traceback.format_exc()
+            output_queue.put(error_payload)
             break
 
 # ================ Main Rollout Class ================
@@ -907,8 +905,10 @@ class RobHFRollout(BaseRollout):
             if init_data.get("type") == "error":
                 for p in processes:
                     p.terminate()
+                cleanup_tb = init_data.get("cleanup_traceback")
+                cleanup_msg = f"\nCleanup traceback:\n{cleanup_tb}\n" if cleanup_tb else ""
                 raise RuntimeError(
-                    f"LIBERO env worker failed during init (idx={idx}).\n{init_data.get('traceback','')}"
+                    f"LIBERO env worker failed during init (idx={idx}).\n{init_data.get('traceback','')}{cleanup_msg}"
                 )
             assert init_data['type'] == 'init'
             task_descriptions.append(init_data["task_description"])
@@ -963,8 +963,10 @@ class RobHFRollout(BaseRollout):
                 if result.get("type") == "error":
                     for p in processes:
                         p.terminate()
+                    cleanup_tb = result.get("cleanup_traceback")
+                    cleanup_msg = f"\nCleanup traceback:\n{cleanup_tb}\n" if cleanup_tb else ""
                     raise RuntimeError(
-                        f"LIBERO env worker failed during step (idx={idx}).\n{result.get('traceback','')}"
+                        f"LIBERO env worker failed during step (idx={idx}).\n{result.get('traceback','')}{cleanup_msg}"
                     )
                 assert result['type'] == 'step'
                 new_inputs[idx] = self._obs_to_input(result['obs'], is_robotwin=False)
