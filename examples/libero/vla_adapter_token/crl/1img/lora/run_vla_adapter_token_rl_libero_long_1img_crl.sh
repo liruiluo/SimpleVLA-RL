@@ -2,6 +2,9 @@
 set -euo pipefail
 set -x
 
+# Make CUDA errors synchronous for clearer stack traces (debugging).
+export CUDA_LAUNCH_BLOCKING=1
+
 # CRL (sequential tasks) launcher for LIBERO-Long, 1-image, LoRA.
 
 # Determine repo root.
