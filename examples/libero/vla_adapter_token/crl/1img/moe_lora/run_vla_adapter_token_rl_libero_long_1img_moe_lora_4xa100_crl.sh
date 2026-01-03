@@ -28,7 +28,7 @@ if [ -z "${REPO_ROOT:-}" ]; then
 fi
 
 # Keep CRL wrappers minimal so 4-GPU tuning stays identical to the underlying RL launcher.
-_args=(data.use_crl=True trainer.crl_eval_on_switch=True trainer.crl_save_on_switch=True)
+_args=(data.use_crl=True data.val_batch_size=32 trainer.crl_eval_on_switch=True trainer.crl_save_on_switch=True)
 if [ -n "${CRL_STEPS_PER_TASK:-}" ]; then
   _args+=(trainer.crl_steps_per_task="${CRL_STEPS_PER_TASK}")
 fi

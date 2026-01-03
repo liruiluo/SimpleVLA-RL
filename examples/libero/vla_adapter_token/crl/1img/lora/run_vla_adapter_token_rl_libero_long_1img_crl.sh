@@ -27,7 +27,7 @@ if [ -z "${REPO_ROOT:-}" ]; then
     fi
 fi
 
-_args=(data.use_crl=True trainer.crl_eval_on_switch=True trainer.crl_save_on_switch=True actor_rollout_ref.model.save_merged_model=False)
+_args=(data.use_crl=True data.val_batch_size=32 trainer.crl_eval_on_switch=True trainer.crl_save_on_switch=True actor_rollout_ref.model.save_merged_model=False)
 if [ -n "${CRL_STEPS_PER_TASK:-}" ]; then
   _args+=(trainer.crl_steps_per_task="${CRL_STEPS_PER_TASK}")
 fi
