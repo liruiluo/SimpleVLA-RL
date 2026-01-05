@@ -5,6 +5,9 @@ set -x
 # Make CUDA errors synchronous for clearer stack traces (debugging).
 export CUDA_LAUNCH_BLOCKING=1
 
+# Enable NaN/Inf debug checks in rollout (set VERL_DEBUG_NAN=0 to disable).
+export VERL_DEBUG_NAN="${VERL_DEBUG_NAN:-1}"
+
 # CRL (sequential tasks) launcher for LIBERO-Long, 1-image, LoRA, 4xGPU single node.
 
 # Determine repo root.

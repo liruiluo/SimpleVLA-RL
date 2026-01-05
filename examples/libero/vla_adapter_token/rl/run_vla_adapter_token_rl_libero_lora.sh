@@ -247,7 +247,7 @@ ALIGN_PATH="$ALIGN_PATH" TRAINER_RUNTIME_ENV="$TRAINER_RUNTIME_ENV" HYDRA_FULL_E
     actor_rollout_ref.model.target_modules=$TARGET_MODULES \
     actor_rollout_ref.model.action_token_len=7 \
     actor_rollout_ref.model.action_chunks_len=8 \
-    actor_rollout_ref.actor.optim.lr=5e-6 \
+    actor_rollout_ref.actor.optim.lr=5e-5 \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
     actor_rollout_ref.actor.ppo_micro_batch_size=$NUM_GPUS \

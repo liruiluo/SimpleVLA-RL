@@ -2,6 +2,9 @@
 set -euo pipefail
 set -x
 
+# Enable NaN/Inf debug checks in rollout (set VERL_DEBUG_NAN=0 to disable).
+export VERL_DEBUG_NAN="${VERL_DEBUG_NAN:-1}"
+
 # 4xGPU single-node launcher for VLA-Adapter token RL on LIBERO (libero_object, 1-image checkpoint).
 # Thin wrapper around `examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_object_1img.sh`.
 #
@@ -47,7 +50,7 @@ export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 
 bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_object_1img.sh" \
   data.train_batch_size=32 \
-  data.val_batch_size=64 \
+  data.val_batch_size=32 \
   actor_rollout_ref.rollout.micro_batch_size=4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \
   actor_rollout_ref.ref.log_prob_micro_batch_size=64 \
