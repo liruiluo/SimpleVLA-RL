@@ -32,6 +32,18 @@ export CUDA_LAUNCH_BLOCKING=1
 export TORCH_USE_CUDA_DSA=1
 export ROBOT_PLATFORM=ALOHA  # Use LIBERO: ROBOT_PLATFORM=LIBERO  Use Robotwin ROBOT_PLATFORM=ALOHA
 
+# Persist Ray session + logs on the shared filesystem so Slurm jobs can be debugged from the head node.
+# Ray will create `session_*` under this directory (instead of `/tmp/ray`).
+if [ -z "${RAY_TMPDIR:-}" ]; then
+    if [ -n "${SLURM_JOB_ID:-}" ]; then
+        RAY_TMPDIR="${REPO_ROOT}/logs/ray/${SLURM_JOB_ID}/${HOSTNAME}"
+    else
+        RAY_TMPDIR="${REPO_ROOT}/logs/ray/local/${HOSTNAME}"
+    fi
+    export RAY_TMPDIR
+fi
+mkdir -p "${RAY_TMPDIR}"
+
 # TensorFlow/XLA is used in image preprocessing (crop/resize). On some clusters,
 # XLA can't find NVVM libdevice unless `XLA_FLAGS` is set.
 # You can override explicitly with: `export XLA_GPU_CUDA_DATA_DIR=/path/to/cuda`.

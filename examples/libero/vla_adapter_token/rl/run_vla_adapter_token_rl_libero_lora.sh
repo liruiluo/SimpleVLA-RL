@@ -50,6 +50,19 @@ export VERL_SAVE_ROLLOUT_VIDEOS="${VERL_SAVE_ROLLOUT_VIDEOS:-0}"
 # Ray can spawn many background processes and reserve a large object store by default.
 # These knobs avoid OS OOM-killer incidents (which can kill VSCode/Electron even if training continues).
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
+
+# Persist Ray session + logs on the shared filesystem so Slurm jobs can be debugged from the head node.
+# Ray will create `session_*` under this directory (instead of `/tmp/ray`).
+if [ -z "${RAY_TMPDIR:-}" ]; then
+    if [ -n "${SLURM_JOB_ID:-}" ]; then
+        RAY_TMPDIR="${REPO_ROOT}/logs/ray/${SLURM_JOB_ID}/${HOSTNAME}"
+    else
+        RAY_TMPDIR="${REPO_ROOT}/logs/ray/local/${HOSTNAME}"
+    fi
+    export RAY_TMPDIR
+fi
+mkdir -p "${RAY_TMPDIR}"
+
 # Optional (unset by default): override Ray object store memory. If set too large, Ray can fail to start.
 # Example: `VERL_RAY_OBJECT_STORE_MEMORY_GB=2 ./examples/libero/vla_adapter_token/rl/run_vla_adapter_token_rl_libero_lora.sh`
 if [ -n "${VERL_RAY_OBJECT_STORE_MEMORY_GB:-}" ]; then

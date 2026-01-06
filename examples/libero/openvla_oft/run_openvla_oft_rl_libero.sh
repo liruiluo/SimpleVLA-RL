@@ -109,6 +109,18 @@ NUM_NODES="${NUM_NODES:-1}"
 # Ray runtime env config (used to pass env vars like WANDB_API_KEY)
 ALIGN_PATH="${ALIGN_PATH:-${REPO_ROOT}/align.json}"
 
+# Persist Ray session + logs on the shared filesystem so Slurm jobs can be debugged from the head node.
+# Ray will create `session_*` under this directory (instead of `/tmp/ray`).
+if [ -z "${RAY_TMPDIR:-}" ]; then
+    if [ -n "${SLURM_JOB_ID:-}" ]; then
+        RAY_TMPDIR="${REPO_ROOT}/logs/ray/${SLURM_JOB_ID}/${HOSTNAME}"
+    else
+        RAY_TMPDIR="${REPO_ROOT}/logs/ray/local/${HOSTNAME}"
+    fi
+    export RAY_TMPDIR
+fi
+mkdir -p "${RAY_TMPDIR}"
+
 # WandB logging:
 # - 默认启用 WandB（假设你已经在登录节点上运行过 `wandb login`）
 # - 如需禁用 WandB，可在提交前 `export DISABLE_WANDB=1`
