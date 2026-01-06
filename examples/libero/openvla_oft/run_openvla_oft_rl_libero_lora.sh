@@ -111,17 +111,26 @@ NUM_NODES="${NUM_NODES:-1}"
 ALIGN_PATH="${ALIGN_PATH:-${REPO_ROOT}/align.json}"
 
 # Persist Ray session + logs on the shared filesystem so Slurm jobs can be debugged from the head node.
-# Ray will create `session_*` under this directory (instead of node-local `/tmp/ray`).
+# Ray uses AF_UNIX sockets for plasma store; the socket path length must be <= 107 bytes.
+# The repo path on shared FS is long, so we use a short `/tmp/...` symlink that points to the shared target dir.
 #
 # IMPORTANT: override any pre-set `RAY_TMPDIR` to avoid reusing the same Ray temp dir across jobs
 # (which can lead to stale Ray state and placement group name collisions).
 if [ -n "${SLURM_JOB_ID:-}" ]; then
-    export RAY_TMPDIR="${REPO_ROOT}/logs/ray/${SLURM_JOB_ID}/${HOSTNAME}"
+    _ray_tmp_target="${REPO_ROOT}/logs/ray/${SLURM_JOB_ID}/${HOSTNAME}"
+    _ray_tmp_link="/tmp/ray_${SLURM_JOB_ID}"
 else
-    export RAY_TMPDIR="${REPO_ROOT}/logs/ray/local/${HOSTNAME}"
+    _ray_tmp_target="${REPO_ROOT}/logs/ray/local/${HOSTNAME}"
+    _ray_tmp_link="/tmp/ray_local_${USER:-user}"
 fi
-mkdir -p "${RAY_TMPDIR}"
-echo "RAY_TMPDIR=${RAY_TMPDIR}" >&2
+mkdir -p "${_ray_tmp_target}"
+if ln -sfn "${_ray_tmp_target}" "${_ray_tmp_link}" 2>/dev/null; then
+    export RAY_TMPDIR="${_ray_tmp_link}"
+else
+    export RAY_TMPDIR="${_ray_tmp_link}"
+    mkdir -p "${RAY_TMPDIR}"
+fi
+echo "RAY_TMPDIR=${RAY_TMPDIR} (target=${_ray_tmp_target})" >&2
 
 # WandB logging:
 if [ -n "${DISABLE_WANDB:-}" ]; then

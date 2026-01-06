@@ -52,18 +52,27 @@ export VERL_SAVE_ROLLOUT_VIDEOS="${VERL_SAVE_ROLLOUT_VIDEOS:-0}"
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 
 # Persist Ray session + logs on the shared filesystem so Slurm jobs can be debugged from the head node.
-# Ray will create `session_*` under this directory (instead of node-local `/tmp/ray`).
+# Ray uses AF_UNIX sockets for plasma store; the socket path length must be <= 107 bytes.
+# The repo path on shared FS is long, so we use a short `/tmp/...` symlink that points to the shared target dir.
 #
-# IMPORTANT: we intentionally override any pre-set `RAY_TMPDIR` (e.g. a shared-but-global path like
-# `/share/.../ray_tmp`) because reusing the same Ray temp dir across jobs can lead to stale Ray state
-# and placement group name collisions (e.g. `global_poolverl_group_4:0 already exists`).
+# IMPORTANT: we intentionally override any pre-set `RAY_TMPDIR` because reusing the same Ray temp dir across jobs
+# can lead to stale Ray state and placement group name collisions (e.g. `global_poolverl_group_4:0 already exists`).
 if [ -n "${SLURM_JOB_ID:-}" ]; then
-    export RAY_TMPDIR="${REPO_ROOT}/logs/ray/${SLURM_JOB_ID}/${HOSTNAME}"
+    _ray_tmp_target="${REPO_ROOT}/logs/ray/${SLURM_JOB_ID}/${HOSTNAME}"
+    _ray_tmp_link="/tmp/ray_${SLURM_JOB_ID}"
 else
-    export RAY_TMPDIR="${REPO_ROOT}/logs/ray/local/${HOSTNAME}"
+    _ray_tmp_target="${REPO_ROOT}/logs/ray/local/${HOSTNAME}"
+    _ray_tmp_link="/tmp/ray_local_${USER:-user}"
 fi
-mkdir -p "${RAY_TMPDIR}"
-echo "RAY_TMPDIR=${RAY_TMPDIR}" >&2
+mkdir -p "${_ray_tmp_target}"
+if ln -sfn "${_ray_tmp_target}" "${_ray_tmp_link}" 2>/dev/null; then
+    export RAY_TMPDIR="${_ray_tmp_link}"
+else
+    # Fallback: still allow Ray to start (node-local), even if shared logging isn't possible.
+    export RAY_TMPDIR="${_ray_tmp_link}"
+    mkdir -p "${RAY_TMPDIR}"
+fi
+echo "RAY_TMPDIR=${RAY_TMPDIR} (target=${_ray_tmp_target})" >&2
 
 # Optional (unset by default): override Ray object store memory. If set too large, Ray can fail to start.
 # Example: `VERL_RAY_OBJECT_STORE_MEMORY_GB=2 ./examples/libero/vla_adapter_token/rl/run_vla_adapter_token_rl_libero_lora.sh`
