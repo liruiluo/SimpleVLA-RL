@@ -273,6 +273,9 @@ trainer:
   # If `data.use_crl=True`, run validation right after finishing each task segment and report mean success
   # across tasks, where each task success is taken right after that task is trained.
   crl_eval_on_switch: True
+  # If `data.use_crl=True`, also run validation immediately after switching to a new task (before training it),
+  # so you can compare `crl/task_success_before_train` vs `crl/task_success_after_train`.
+  crl_eval_on_enter: False
   # If `data.use_crl=True`, save a checkpoint right after finishing each task segment.
   crl_save_on_switch: True
   project_name: verl_examples

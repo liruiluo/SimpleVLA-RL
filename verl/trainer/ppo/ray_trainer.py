@@ -508,6 +508,7 @@ class RayTrainer(object):
 
         use_crl = bool(getattr(self.config.data, "use_crl", False))
         crl_eval_on_switch = bool(self.config.trainer.get("crl_eval_on_switch", False))
+        crl_eval_on_enter = bool(self.config.trainer.get("crl_eval_on_enter", False))
         crl_save_on_switch = bool(self.config.trainer.get("crl_save_on_switch", False))
         crl_task_ids: list[int] | None = None
         crl_steps_per_task: int | None = None
@@ -515,6 +516,7 @@ class RayTrainer(object):
         crl_next_switch_step: int | None = None
         crl_current_task_id: int | None = None
         crl_success_after_train: dict[int, float] = {}
+        crl_success_before_train: dict[int, float] = {}
         crl_ckpt_saved_at_step: dict[int, int] = {}
 
         def _save_crl_checkpoints(task_id: int, step: int) -> None:
@@ -588,6 +590,18 @@ class RayTrainer(object):
                 f"[CRL] Enabled: suite={self.config.data.task_suite_name} task_ids={crl_task_ids} steps_per_task={crl_steps_per_task}"
             )
             print(f"[CRL] Starting task_id={crl_current_task_id} at global_step={global_steps}")
+            if crl_eval_on_enter and self.val_reward_fn is not None:
+                val_metrics = self._validate(global_steps=global_steps)
+                task_success = float(val_metrics.get("test_score/all", float("nan")))
+                crl_success_before_train[int(crl_current_task_id)] = task_success
+                logger.log(
+                    data={
+                        "crl/task_id": float(crl_current_task_id),
+                        "crl/task_success_before_train": task_success,
+                    },
+                    step=global_steps,
+                )
+                print(f"[CRL] task_id={crl_current_task_id} success_before_train={task_success:.4f}")
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -852,6 +866,23 @@ class RayTrainer(object):
                         crl_current_task_id = next_task_id
                         crl_next_switch_step = (crl_task_idx + 1) * crl_steps_per_task
                         print(f"[CRL] Switched to task_id={next_task_id} at global_step={global_steps}")
+                        if (
+                            crl_eval_on_enter
+                            and self.val_reward_fn is not None
+                            and crl_current_task_id is not None
+                            and int(crl_current_task_id) not in crl_success_before_train
+                        ):
+                            val_metrics = self._validate(global_steps=global_steps)
+                            task_success = float(val_metrics.get("test_score/all", float("nan")))
+                            crl_success_before_train[int(crl_current_task_id)] = task_success
+                            logger.log(
+                                data={
+                                    "crl/task_id": float(crl_current_task_id),
+                                    "crl/task_success_before_train": task_success,
+                                },
+                                step=global_steps,
+                            )
+                            print(f"[CRL] task_id={crl_current_task_id} success_before_train={task_success:.4f}")
 
                 if target_steps is not None and global_steps >= target_steps:
                     stop_training = True
