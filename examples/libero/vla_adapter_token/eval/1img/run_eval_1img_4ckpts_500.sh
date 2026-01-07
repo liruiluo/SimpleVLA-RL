@@ -69,7 +69,7 @@ run_one() {
   local name="$1"
   local cmd="$2"
   shift 2
-  local log_dir="${REPO_ROOT}/runs/eval_1img_untrained"
+  local log_dir="${LOG_DIR:-${REPO_ROOT}/runs/eval_1img_untrained}"
   mkdir -p "${log_dir}"
   local log_file="${log_dir}/${name}.log"
   echo "=== ${name} ===" >&2
@@ -96,4 +96,3 @@ fi
 run_one "libero_long" \
   "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_long_1img.sh" \
   "${long_args[@]}"
-

@@ -343,6 +343,7 @@ class RayTrainer(object):
     def _validate(self, global_steps=0):
         reward_tensor_lst = []
         data_source_lst = []
+        task_id_lst = []
         metric_dict = {}
         max_val_batches = self.config.trainer.get("max_val_batches", None)
         if max_val_batches is not None:
@@ -384,6 +385,8 @@ class RayTrainer(object):
             #data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
             #data_source_lst.append( [self.config.data.task_suite_name] * reward_tensor.shape[0])
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', [self.config.data.task_suite_name] * reward_tensor.shape[0]))
+            if "task_id" in test_batch.batch:
+                task_id_lst.append(test_batch.batch["task_id"].detach().cpu().numpy())
 
             if max_val_batches is not None and (batch_idx + 1) >= max_val_batches:
                 break
@@ -403,6 +406,20 @@ class RayTrainer(object):
             metric_dict[f'test_score/{data_source}'] = np.mean(rewards)
 
         metric_dict[f'test_score/all'] = reward_tensor.mean().item()
+
+        # Also report per-task success for robotics suites (e.g., LIBERO's 10 tasks).
+        if len(task_id_lst) > 0:
+            task_ids = np.concatenate(task_id_lst, axis=0)
+            if task_ids.ndim > 1:
+                task_ids = task_ids.reshape(task_ids.shape[0], -1)[:, 0]
+            task_ids = task_ids.astype(int)
+            rewards_np = reward_tensor.numpy()
+            for tid in sorted(set(task_ids.tolist())):
+                mask = task_ids == tid
+                if not np.any(mask):
+                    continue
+                metric_dict[f"test_count/task_{tid}"] = float(np.sum(mask))
+                metric_dict[f"test_score/task_{tid}"] = float(np.mean(rewards_np[mask]))
 
         return metric_dict
 
