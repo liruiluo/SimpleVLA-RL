@@ -118,6 +118,16 @@ def main(config):
         if os.environ.get("VERL_RAY_DISABLE_DASHBOARD", "1") == "1":
             init_kwargs["include_dashboard"] = False
 
+        # Cap Ray's perceived resources to avoid spawning hundreds of idle workers on large CPU nodes,
+        # which can overload raylet/gcs and trigger keepalive timeouts / disconnect cascades.
+        num_cpus = os.environ.get("VERL_RAY_NUM_CPUS", "").strip()
+        if num_cpus:
+            init_kwargs["num_cpus"] = int(float(num_cpus))
+
+        num_gpus = os.environ.get("VERL_RAY_NUM_GPUS", "").strip()
+        if num_gpus:
+            init_kwargs["num_gpus"] = float(num_gpus)
+
         obj_store_gb = os.environ.get("VERL_RAY_OBJECT_STORE_MEMORY_GB", "").strip()
         if obj_store_gb:
             init_kwargs["object_store_memory"] = int(float(obj_store_gb) * (1024**3))

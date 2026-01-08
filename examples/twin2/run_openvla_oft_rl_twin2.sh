@@ -32,6 +32,17 @@ export CUDA_LAUNCH_BLOCKING=1
 export TORCH_USE_CUDA_DSA=1
 export ROBOT_PLATFORM=ALOHA  # Use LIBERO: ROBOT_PLATFORM=LIBERO  Use Robotwin ROBOT_PLATFORM=ALOHA
 
+# Slurm often allocates fewer CPUs than the physical node (and nodes may report hyperthreads).
+# Let Ray see the allocated CPUs to avoid spawning hundreds of idle workers which can overload raylet/gcs.
+export VERL_RAY_NUM_CPUS="${VERL_RAY_NUM_CPUS:-${SLURM_CPUS_ON_NODE:-${SLURM_CPUS_PER_TASK:-128}}}"
+
+# Reduce Ray control-plane load by disabling task-event reporting to GCS (helps avoid heartbeat timeouts).
+export RAY_task_events_report_interval_ms="${RAY_task_events_report_interval_ms:-0}"
+
+# Raise the file-descriptor limit if possible (Ray can open many fds for sockets/processes).
+ulimit -n 1048576 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+echo "VERL_RAY_NUM_CPUS=${VERL_RAY_NUM_CPUS} RAY_task_events_report_interval_ms=${RAY_task_events_report_interval_ms} ulimit_nofile=$(ulimit -n)" >&2
+
 # Persist Ray session + logs on the shared filesystem so Slurm jobs can be debugged from the head node.
 # Ray uses AF_UNIX sockets for plasma store; the socket path length must be <= 107 bytes.
 # The repo path on shared FS is long, so we use a short `/tmp/...` symlink that points to the shared target dir.

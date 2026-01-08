@@ -53,6 +53,17 @@ export CUDA_LAUNCH_BLOCKING=1
 export TORCH_USE_CUDA_DSA=1
 export ROBOT_PLATFORM=LIBERO
 
+# Slurm often allocates fewer CPUs than the physical node (and nodes may report hyperthreads).
+# Let Ray see the allocated CPUs to avoid spawning hundreds of idle workers which can overload raylet/gcs.
+export VERL_RAY_NUM_CPUS="${VERL_RAY_NUM_CPUS:-${SLURM_CPUS_ON_NODE:-${SLURM_CPUS_PER_TASK:-128}}}"
+
+# Reduce Ray control-plane load by disabling task-event reporting to GCS (helps avoid heartbeat timeouts).
+export RAY_task_events_report_interval_ms="${RAY_task_events_report_interval_ms:-0}"
+
+# Raise the file-descriptor limit if possible (Ray can open many fds for sockets/processes).
+ulimit -n 1048576 2>/dev/null || ulimit -n 262144 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+echo "VERL_RAY_NUM_CPUS=${VERL_RAY_NUM_CPUS} RAY_task_events_report_interval_ms=${RAY_task_events_report_interval_ms} ulimit_nofile=$(ulimit -n)" >&2
+
 # TensorFlow/XLA is used in image preprocessing (see `verl/utils/libero_utils.py`).
 if [[ "${XLA_FLAGS:-}" != *"--xla_gpu_cuda_data_dir="* ]]; then
     _candidate_cuda_dirs=()

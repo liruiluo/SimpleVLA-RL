@@ -15,6 +15,7 @@
 import time
 from typing import Dict, List, Any, Tuple
 
+import os
 import ray
 from ray.util import list_named_actors
 from ray.util.placement_group import placement_group, PlacementGroup
@@ -60,13 +61,21 @@ class RayResourcePool(ResourcePool):
         self.name_prefix = name_prefix
         self.pgs = None
         self.detached = detached
+        # Placement groups are registered by name in the Ray cluster.
+        # Using a deterministic name can break when the driver/task is retried while the old PG
+        # record still exists (e.g. after worker SYSTEM_ERROR / GCS reconnect), resulting in:
+        #   "Failed to create placement group ... because name '...already exists'"
+        # Make the PG name unique per resource pool instance.
+        job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("RAY_JOB_ID")
+        rand = get_random_string(6)
+        self._pg_name_uid = f"{job_id}_{rand}" if job_id else rand
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None):
         if self.pgs is not None:
             return self.pgs
 
         pg_name_prefix = name if name else \
-            f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
+            f"{self.name_prefix}_{self._pg_name_uid}verl_group_{'_'.join([str(count) for count in self._store])}:"
         # print(f"pg_name_prefix = {pg_name_prefix}")
         pg_scheme = [[{
             "CPU": self.max_collocate_count,
