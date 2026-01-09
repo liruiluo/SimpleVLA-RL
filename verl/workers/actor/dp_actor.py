@@ -32,6 +32,8 @@ import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
+from verl.utils.sphere import SphereMoELoRATracer, compute_sphere_loss_from_last_moe_lora
+
 __all__ = ['DataParallelPPOActor']
 
 
@@ -54,8 +56,99 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_ulysses_sp = False #self.ulysses_sequence_parallel_size > 1
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+        self._sphere_tracer: SphereMoELoRATracer | None = None
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_sphere_tracer(self) -> SphereMoELoRATracer:
+        if self._sphere_tracer is None:
+            self._sphere_tracer = SphereMoELoRATracer(self.actor_module)
+            self._sphere_tracer.ensure_installed()
+        return self._sphere_tracer
+
+    def _maybe_compute_sphere_loss(
+        self,
+        *,
+        token_mask_flat: torch.Tensor | None,
+    ) -> torch.Tensor:
+        sphere_coef = float(self.config.get("sphere_coef", 0.0) or 0.0)
+        if sphere_coef <= 0.0:
+            # Disabled; return a tensor on the correct device for loss arithmetic.
+            device = token_mask_flat.device if token_mask_flat is not None else torch.device("cuda")
+            return torch.zeros((), device=device, dtype=torch.float32)
+
+        sphere_temperature = float(self.config.get("sphere_temperature", 1.0) or 1.0)
+
+        tracer = self._get_sphere_tracer()
+        return compute_sphere_loss_from_last_moe_lora(
+            tracer,
+            token_mask_flat=token_mask_flat,
+            temperature=sphere_temperature,
+        )
+
+    def _sphere_scale(
+        self,
+        *,
+        base_loss: torch.Tensor,
+        sphere_loss: torch.Tensor,
+    ) -> torch.Tensor:
+        mode = str(self.config.get("sphere_mode", "fixed") or "fixed").lower()
+        eps = float(self.config.get("sphere_eps", 1e-8) or 1e-8)
+
+        if mode == "fixed":
+            return base_loss.new_tensor(float(self.config.get("sphere_coef", 0.0) or 0.0))
+
+        if mode == "loss_ratio":
+            target_ratio = float(self.config.get("sphere_target_ratio", 0.0) or 0.0)
+            scale = target_ratio * base_loss.detach().abs() / (sphere_loss.detach().abs() + eps)
+            return scale
+
+        if mode == "grad_norm":
+            rho = float(self.config.get("sphere_rho", 0.0) or 0.0)
+            # NOTE: With FSDP `use_orig_params=True`, `module.parameters()` may include view-params.
+            # `torch.autograd.grad(..., params)` on those can trip FSDP writeback
+            # ("Cannot writeback when the gradient shape changes"). Prefer FSDP handle flat params.
+            params = None
+            if isinstance(self.actor_module, FSDP):
+                handles = getattr(self.actor_module, "_all_handles", None)
+                if isinstance(handles, list) and handles:
+                    flat_params = []
+                    for h in handles:
+                        fp = getattr(h, "flat_param", None)
+                        if fp is not None and getattr(fp, "requires_grad", False):
+                            flat_params.append(fp)
+                    if flat_params:
+                        params = flat_params
+
+            if params is None:
+                params = [p for p in self.actor_module.parameters() if p.requires_grad]
+            if not params:
+                raise RuntimeError("SPHERE grad_norm mode requires trainable actor parameters.")
+
+            base_grads = torch.autograd.grad(base_loss, params, retain_graph=True, allow_unused=True)
+            sphere_grads = torch.autograd.grad(sphere_loss, params, retain_graph=True, allow_unused=True)
+            if isinstance(self.actor_module, FSDP):
+                # Defensive: ensure `autograd.grad` did not materialize `.grad` on orig/view params.
+                self.actor_module.zero_grad(set_to_none=True)
+
+            def l2_norm(grads):
+                acc = None
+                for g in grads:
+                    if g is None:
+                        continue
+                    g2 = torch.sum(g.float() * g.float())
+                    acc = g2 if acc is None else (acc + g2)
+                if acc is None:
+                    return base_loss.new_tensor(0.0)
+                return torch.sqrt(acc + eps)
+
+            base_norm = l2_norm(base_grads)
+            sphere_norm = l2_norm(sphere_grads)
+            return (rho * base_norm / (sphere_norm + eps)).detach()
+
+        raise ValueError(f"Unknown sphere_mode: {mode}")
+
+    def _forward_micro_batch(
+        self, micro_batch, temperature, return_sphere_loss: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
@@ -68,6 +161,14 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch['attention_mask']
             position_ids = micro_batch['position_ids']
 
+            sphere_coef = float(self.config.get("sphere_coef", 0.0) or 0.0)
+            sphere_enabled = return_sphere_loss and (sphere_coef > 0.0)
+            token_mask_flat: torch.Tensor | None = None
+            tracer = None
+            if sphere_enabled:
+                tracer = self._get_sphere_tracer()
+                tracer.clear()
+
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
                                                            attention_mask)  # input_ids_rmpad (total_nnz, ...)
@@ -76,6 +177,10 @@ class DataParallelPPOActor(BasePPOActor):
                 # unpad the position_ids to align the rotary
                 position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
                                                       indices).transpose(0, 1)
+
+                if sphere_enabled:
+                    pos = position_ids_rmpad.reshape(-1)
+                    token_mask_flat = (pos >= (seqlen - response_length - 1)) & (pos < (seqlen - 1))
 
                 # for compute the log_prob
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
@@ -128,6 +233,13 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
+                if sphere_enabled:
+                    start = seqlen - response_length - 1
+                    end = seqlen - 1
+                    token_mask = torch.zeros((batch_size, seqlen), device=input_ids.device, dtype=torch.bool)
+                    token_mask[:, start:end] = True
+                    token_mask_flat = token_mask.reshape(-1)
+
                 output = self.actor_module(input_ids=input_ids,
                                            attention_mask=attention_mask,
                                            position_ids=position_ids,
@@ -138,7 +250,11 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
-            return entropy, log_probs
+            if not sphere_enabled:
+                return entropy, log_probs
+
+            sphere_loss = self._maybe_compute_sphere_loss(token_mask_flat=token_mask_flat)
+            return entropy, log_probs, sphere_loss
 
     def _forward_micro_batch_entropy(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         response_length = micro_batch['responses'].size(-1)
@@ -312,7 +428,14 @@ class DataParallelPPOActor(BasePPOActor):
                 entropy_coeff = self.config.entropy_coeff
 
                 # all return: (bsz, response_length)
-                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                sphere_coef = float(self.config.get("sphere_coef", 0.0) or 0.0)
+                if sphere_coef > 0.0:
+                    entropy, log_prob, sphere_loss = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, return_sphere_loss=True
+                    )
+                else:
+                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                    sphere_loss = None
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                               log_prob=log_prob,
@@ -325,6 +448,10 @@ class DataParallelPPOActor(BasePPOActor):
                 # compute policy loss
                 policy_loss = pg_loss - entropy_loss * entropy_coeff
 
+                if sphere_loss is not None:
+                    scale = self._sphere_scale(base_loss=policy_loss, sphere_loss=sphere_loss)
+                    policy_loss = policy_loss + scale * sphere_loss
+
                 loss = policy_loss / self.gradient_accumulation
                 loss.backward()
 
@@ -334,6 +461,9 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                     'actor/ppo_kl': ppo_kl.detach().item(),
                 }
+                if sphere_loss is not None:
+                    data['actor/sphere_loss'] = float(sphere_loss.detach().item())
+                    data['actor/sphere_scale'] = float(scale.detach().item())
                 append_to_dict(metrics, data)
 
             grad_norm = self._optimizer_step()

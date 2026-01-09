@@ -32,6 +32,8 @@ import verl.utils.torch_functional as verl_F
 from codetiming import Timer
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
+from verl.utils.sphere import SphereMoELoRATracer, compute_sphere_loss_from_last_moe_lora
+
 __all__ = ['RobDataParallelPPOActor']
 
 
@@ -54,6 +56,85 @@ class RobDataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = False #self.ulysses_sequence_parallel_size > 1
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+        self._sphere_tracer: SphereMoELoRATracer | None = None
+
+    def _get_sphere_tracer(self) -> SphereMoELoRATracer:
+        if self._sphere_tracer is None:
+            self._sphere_tracer = SphereMoELoRATracer(self.actor_module)
+            self._sphere_tracer.ensure_installed()
+        return self._sphere_tracer
+
+    def _maybe_compute_sphere_loss(self, *, token_mask_flat: torch.Tensor | None) -> torch.Tensor:
+        sphere_coef = float(self.config.get("sphere_coef", 0.0) or 0.0)
+        if sphere_coef <= 0.0:
+            device = token_mask_flat.device if token_mask_flat is not None else torch.device("cuda")
+            return torch.zeros((), device=device, dtype=torch.float32)
+
+        sphere_temperature = float(self.config.get("sphere_temperature", 1.0) or 1.0)
+
+        tracer = self._get_sphere_tracer()
+        return compute_sphere_loss_from_last_moe_lora(
+            tracer,
+            token_mask_flat=token_mask_flat,
+            temperature=sphere_temperature,
+        )
+
+    def _sphere_scale(self, *, base_loss: torch.Tensor, sphere_loss: torch.Tensor) -> torch.Tensor:
+        mode = str(self.config.get("sphere_mode", "fixed") or "fixed").lower()
+        eps = float(self.config.get("sphere_eps", 1e-8) or 1e-8)
+
+        if mode == "fixed":
+            return base_loss.new_tensor(float(self.config.get("sphere_coef", 0.0) or 0.0))
+
+        if mode == "loss_ratio":
+            target_ratio = float(self.config.get("sphere_target_ratio", 0.0) or 0.0)
+            scale = target_ratio * base_loss.detach().abs() / (sphere_loss.detach().abs() + eps)
+            return scale
+
+        if mode == "grad_norm":
+            rho = float(self.config.get("sphere_rho", 0.0) or 0.0)
+            # NOTE: With FSDP `use_orig_params=True`, `module.parameters()` may include view-params.
+            # `torch.autograd.grad(..., params)` on those can trip FSDP writeback
+            # ("Cannot writeback when the gradient shape changes"). Prefer FSDP handle flat params.
+            params = None
+            if isinstance(self.actor_module, FSDP):
+                handles = getattr(self.actor_module, "_all_handles", None)
+                if isinstance(handles, list) and handles:
+                    flat_params = []
+                    for h in handles:
+                        fp = getattr(h, "flat_param", None)
+                        if fp is not None and getattr(fp, "requires_grad", False):
+                            flat_params.append(fp)
+                    if flat_params:
+                        params = flat_params
+
+            if params is None:
+                params = [p for p in self.actor_module.parameters() if p.requires_grad]
+            if not params:
+                raise RuntimeError("SPHERE grad_norm mode requires trainable actor parameters.")
+
+            base_grads = torch.autograd.grad(base_loss, params, retain_graph=True, allow_unused=True)
+            sphere_grads = torch.autograd.grad(sphere_loss, params, retain_graph=True, allow_unused=True)
+            if isinstance(self.actor_module, FSDP):
+                # Defensive: ensure `autograd.grad` did not materialize `.grad` on orig/view params.
+                self.actor_module.zero_grad(set_to_none=True)
+
+            def l2_norm(grads):
+                acc = None
+                for g in grads:
+                    if g is None:
+                        continue
+                    g2 = torch.sum(g.float() * g.float())
+                    acc = g2 if acc is None else (acc + g2)
+                if acc is None:
+                    return base_loss.new_tensor(0.0)
+                return torch.sqrt(acc + eps)
+
+            base_norm = l2_norm(base_grads)
+            sphere_norm = l2_norm(sphere_grads)
+            return (rho * base_norm / (sphere_norm + eps)).detach()
+
+        raise ValueError(f"Unknown sphere_mode: {mode}")
        
     def process_tensor(self, tensor, pad_id):
         mask = tensor != pad_id
@@ -354,10 +435,22 @@ class RobDataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
     
-    def _forward_micro_batch_update(self, input_ids, attention_mask, pixel_values, responses, temperature, proprio) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch_update(
+        self,
+        input_ids,
+        attention_mask,
+        pixel_values,
+        responses,
+        temperature,
+        proprio,
+        return_sphere_loss: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
        
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            sphere_coef = float(self.config.get("sphere_coef", 0.0) or 0.0)
+            sphere_enabled = bool(return_sphere_loss and (sphere_coef > 0.0))
+            sphere_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
             if self.config.vla == "openvla-oft":
                 
                 input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
@@ -385,6 +478,8 @@ class RobDataParallelPPOActor(BasePPOActor):
                 log_probs = log_probs.reshape((1, -1))
                 entropy = entropy.reshape((1, -1))
                 
+                if sphere_enabled:
+                    return entropy, log_probs, sphere_loss
                 return entropy, log_probs
             
             elif self.config.vla == "openvla":
@@ -408,6 +503,8 @@ class RobDataParallelPPOActor(BasePPOActor):
                 log_probs = log_probs.reshape((1, -1))
                 entropy = entropy.reshape((1, -1))
 
+                if sphere_enabled:
+                    return entropy, log_probs, sphere_loss
                 return entropy, log_probs
             
             elif self.config.vla == "vla-adapter-token":
@@ -418,6 +515,7 @@ class RobDataParallelPPOActor(BasePPOActor):
 
                 log_probs_parts = []
                 entropy_parts = []
+                sphere_parts: list[torch.Tensor] = []
                 for s0 in range(0, n, traj_chunk):
                     s1 = min(n, s0 + traj_chunk)
                     ids = input_ids[s0:s1]
@@ -428,6 +526,9 @@ class RobDataParallelPPOActor(BasePPOActor):
                     action_input_ids, action_attention_mask, labels, prompt_lens = self._build_vla_adapter_token_action_inputs(
                         input_ids=ids, attention_mask=mask
                     )
+                    if sphere_enabled:
+                        tracer = self._get_sphere_tracer()
+                        tracer.clear()
                     action_logits, start_token = self._forward_vla_adapter_token_action_logits(
                         action_input_ids=action_input_ids,
                         action_attention_mask=action_attention_mask,
@@ -436,6 +537,49 @@ class RobDataParallelPPOActor(BasePPOActor):
                         prompt_lens=prompt_lens,
                         temperature=temperature,
                     )
+                    if sphere_enabled:
+                        trace = self._get_sphere_tracer().last
+                        if trace is None:
+                            raise RuntimeError("SPHERE enabled but no MoE-LoRA router site was observed in forward.")
+
+                        hidden = trace.hidden
+                        num_patches = int(
+                            self.actor_module.vision_backbone.get_num_patches()
+                            * self.actor_module.vision_backbone.get_num_images_in_input()
+                        )
+                        action_token_count = int(self.config.action_token_len * self.config.action_chunks_len)
+                        start_positions = num_patches + prompt_lens.to(torch.long) - 1  # (B,)
+                        positions = start_positions[:, None] + torch.arange(action_token_count, device=ids.device)[None, :]
+
+                        if hidden.dim() == 3:
+                            bsz, seqlen_hidden = int(hidden.size(0)), int(hidden.size(1))
+                            if bsz != int(ids.size(0)):
+                                raise ValueError(f"SPHERE batch mismatch: hidden_bsz={bsz} ids_bsz={int(ids.size(0))}")
+                            if int(positions.max().item()) >= seqlen_hidden:
+                                raise ValueError(
+                                    f"SPHERE token index out of range: max_pos={int(positions.max().item())} seqlen_hidden={seqlen_hidden}"
+                                )
+                            token_mask = torch.zeros((bsz, seqlen_hidden), device=ids.device, dtype=torch.bool)
+                            token_mask.scatter_(dim=1, index=positions, value=True)
+                            token_mask_flat = token_mask.reshape(-1)
+                        elif hidden.dim() == 2:
+                            bsz = int(ids.size(0))
+                            if hidden.size(0) % bsz != 0:
+                                raise ValueError(
+                                    f"SPHERE hidden token count not divisible by batch: hidden_T={int(hidden.size(0))} bsz={bsz}"
+                                )
+                            seqlen_hidden = int(hidden.size(0) // bsz)
+                            if int(positions.max().item()) >= seqlen_hidden:
+                                raise ValueError(
+                                    f"SPHERE token index out of range: max_pos={int(positions.max().item())} seqlen_hidden={seqlen_hidden}"
+                                )
+                            token_mask = torch.zeros((bsz, seqlen_hidden), device=ids.device, dtype=torch.bool)
+                            token_mask.scatter_(dim=1, index=positions, value=True)
+                            token_mask_flat = token_mask.reshape(-1)
+                        else:
+                            raise ValueError(f"Unexpected hidden rank for SPHERE: shape={tuple(hidden.shape)}")
+
+                        sphere_parts.append(self._maybe_compute_sphere_loss(token_mask_flat=token_mask_flat))
                     token_offsets = (resp.to(torch.long) - start_token).clamp(min=0, max=255)
                     chunk_log_probs = logprobs_from_logits(action_logits, token_offsets)  # (chunk, 56)
                     chunk_entropy = verl_F.entropy_from_logits(action_logits)  # (chunk, 56)
@@ -444,6 +588,11 @@ class RobDataParallelPPOActor(BasePPOActor):
 
                 log_probs = torch.cat(log_probs_parts, dim=0).reshape((1, -1))
                 entropy = torch.cat(entropy_parts, dim=0).reshape((1, -1))
+                if sphere_enabled and sphere_parts:
+                    sphere_loss = torch.stack(sphere_parts).mean()
+                    return entropy, log_probs, sphere_loss
+                if sphere_enabled:
+                    return entropy, log_probs, sphere_loss
                 return entropy, log_probs
                 
 
@@ -704,6 +853,10 @@ class RobDataParallelPPOActor(BasePPOActor):
                     'actor/pg_clipfrac': 0,
                     'actor/ppo_kl': 0,
                 }
+                sphere_coef = float(self.config.get("sphere_coef", 0.0) or 0.0)
+                if sphere_coef > 0.0:
+                    loss_info["actor/sphere_loss"] = 0.0
+                    loss_info["actor/sphere_scale"] = 0.0
                 
                 assert traj_len % self.config.traj_mini_batch_size ==0
                 traj_split_num = int(traj_len/self.config.traj_mini_batch_size)
@@ -711,12 +864,27 @@ class RobDataParallelPPOActor(BasePPOActor):
 
                 for i in range(0, traj_len, int(traj_len/traj_split_num)):
                    
-                    entropy, log_prob = self._forward_micro_batch_update(input_ids=input_ids[i:i+int(traj_len/traj_split_num)], 
-                                                                         attention_mask=attention_mask[i:i+int(traj_len/traj_split_num)], 
-                                                                         pixel_values=pixel_values[i:i+int(traj_len/traj_split_num)], 
-                                                                         responses=responses[i:i+int(traj_len/traj_split_num)], 
-                                                                         temperature=temperature,
-                                                                         proprio=proprio[i:i+int(traj_len/traj_split_num)] if proprio is not None  else None)
+                    if sphere_coef > 0.0:
+                        entropy, log_prob, sphere_loss = self._forward_micro_batch_update(
+                            input_ids=input_ids[i:i+int(traj_len/traj_split_num)],
+                            attention_mask=attention_mask[i:i+int(traj_len/traj_split_num)],
+                            pixel_values=pixel_values[i:i+int(traj_len/traj_split_num)],
+                            responses=responses[i:i+int(traj_len/traj_split_num)],
+                            temperature=temperature,
+                            proprio=proprio[i:i+int(traj_len/traj_split_num)] if proprio is not None  else None,
+                            return_sphere_loss=True,
+                        )
+                    else:
+                        entropy, log_prob = self._forward_micro_batch_update(
+                            input_ids=input_ids[i:i+int(traj_len/traj_split_num)],
+                            attention_mask=attention_mask[i:i+int(traj_len/traj_split_num)],
+                            pixel_values=pixel_values[i:i+int(traj_len/traj_split_num)],
+                            responses=responses[i:i+int(traj_len/traj_split_num)],
+                            temperature=temperature,
+                            proprio=proprio[i:i+int(traj_len/traj_split_num)] if proprio is not None  else None,
+                            return_sphere_loss=False,
+                        )
+                        sphere_loss = None
                     
                     slice_id = i*self.config.action_token_len*self.config.action_chunks_len
                     next_slice_id = (i+int(traj_len/traj_split_num))*self.config.action_token_len*self.config.action_chunks_len
@@ -737,6 +905,11 @@ class RobDataParallelPPOActor(BasePPOActor):
                     ppo_kl = ppo_kl* response_mask_tmp_sum / response_mask_sum
                     
                     policy_loss = pg_loss / response_mask_sum
+                    if sphere_loss is not None:
+                        weight = response_mask_tmp_sum / response_mask_sum
+                        sphere_term = sphere_loss * weight
+                        scale = self._sphere_scale(base_loss=policy_loss, sphere_loss=sphere_term)
+                        policy_loss = policy_loss + scale * sphere_term
                     
                     loss = policy_loss / self.gradient_accumulation
                     
@@ -745,6 +918,9 @@ class RobDataParallelPPOActor(BasePPOActor):
                     loss_info['actor/pg_loss'] =  loss_info['actor/pg_loss'] + policy_loss.detach().item()
                     loss_info['actor/pg_clipfrac'] = loss_info['actor/pg_clipfrac'] + pg_clipfrac.detach().item()
                     loss_info['actor/ppo_kl'] = loss_info['actor/ppo_kl'] +  ppo_kl.detach().item()
+                    if sphere_loss is not None:
+                        loss_info["actor/sphere_loss"] = loss_info["actor/sphere_loss"] + float(sphere_loss.detach().item())
+                        loss_info["actor/sphere_scale"] = loss_info.get("actor/sphere_scale", 0.0) + float(scale.detach().item())
 
                 append_to_dict(metrics, loss_info)
                

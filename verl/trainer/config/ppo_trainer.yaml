@@ -75,6 +75,13 @@ actor_rollout_ref:
     clip_ratio_high: 0.28
     clip_ratio_low: 0.2
     entropy_coeff: 0.001
+    # SPHERE regularization (paper-aligned; MoE-LoRA only; requires `model.use_moe_lora=true`)
+    sphere_coef: 0.0
+    sphere_temperature: 1.0
+    sphere_mode: fixed  # fixed | loss_ratio | grad_norm
+    sphere_target_ratio: 0.0  # used when sphere_mode=loss_ratio
+    sphere_rho: 0.0  # used when sphere_mode=grad_norm (paper-style)
+    sphere_eps: 1e-8
     ppo_epochs: 1
     shuffle: True
     ulysses_sequence_parallel_size: 1 # sp size

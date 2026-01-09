@@ -107,16 +107,23 @@ def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
         runtime_env = None
-        if os.path.isfile(str(config.trainer.runtime_env)):
-            with open(str(config.trainer.runtime_env), 'r') as f:
-                runtime_env = json.load(f)
-        else:
-            runtime_env = {'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}}
+        runtime_env_path = str(getattr(config.trainer, "runtime_env", "") or "").strip()
+        if runtime_env_path and runtime_env_path.lower() not in {"none", "null"}:
+            if os.path.isfile(runtime_env_path):
+                with open(runtime_env_path, 'r') as f:
+                    runtime_env = json.load(f)
+            else:
+                runtime_env = {'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}}
 
         init_kwargs = {}
         # Reduce driver overhead for local single-node runs (dashboard consumes memory and spawns extra processes).
         if os.environ.get("VERL_RAY_DISABLE_DASHBOARD", "1") == "1":
             init_kwargs["include_dashboard"] = False
+
+        # Avoid accidentally connecting to a previously started cluster (Ray auto-detects
+        # `/tmp/ray/ray_current_cluster` even when `address` is not provided).
+        ray_address = os.environ.get("VERL_RAY_ADDRESS", "").strip()
+        init_kwargs["address"] = ray_address if ray_address else "local"
 
         # Cap Ray's perceived resources to avoid spawning hundreds of idle workers on large CPU nodes,
         # which can overload raylet/gcs and trigger keepalive timeouts / disconnect cascades.
