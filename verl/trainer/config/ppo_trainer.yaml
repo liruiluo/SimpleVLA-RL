@@ -274,6 +274,14 @@ trainer:
   total_epochs: 30
   total_training_steps: null
   total_steps: null  # Stop after N RL updates (global_steps); overrides total_epochs if set.
+  # If True, always save the last completed step at the end of training.
+  save_final: False
+  # Resume support:
+  # - If set to a checkpoint dir (e.g. `.../actor/global_step_99`), load weights from it and continue with
+  #   `global_steps` starting at 100.
+  # - If set to `auto`/`latest` OR `auto_resume=True`, pick the latest checkpoint under `default_local_dir/actor/`.
+  resume_from: null
+  auto_resume: True
   # If `data.use_crl=True`, optionally set how many RL updates to spend per task before moving to the next.
   # If null, we split `trainer.total_steps` evenly across `data.crl_task_ids` (ceil).
   crl_steps_per_task: null

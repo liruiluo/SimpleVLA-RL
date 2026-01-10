@@ -27,6 +27,132 @@ from verl.trainer.ppo.ray_trainer import RayTrainer
 import warnings
 warnings.filterwarnings("ignore", message="Batch mode enable graph is only supported with num_graph_seeds==1")
 
+def parse_global_step_dir(path: str) -> int | None:
+    base = os.path.basename(os.path.normpath(path))
+    if not base.startswith("global_step_"):
+        return None
+    suffix = base[len("global_step_") :]
+    try:
+        return int(suffix)
+    except ValueError:
+        return None
+
+
+def find_latest_global_step_dir(root: str) -> tuple[str | None, int | None]:
+    """Return (ckpt_dir, step) for the max step under root, where dirs are named global_step_N."""
+    if not root or not os.path.isdir(root):
+        return None, None
+    best_step = None
+    best_dir = None
+    for name in os.listdir(root):
+        full = os.path.join(root, name)
+        if not os.path.isdir(full):
+            continue
+        step = parse_global_step_dir(full)
+        if step is None:
+            continue
+        if best_step is None or step > best_step:
+            best_step = step
+            best_dir = full
+    return best_dir, best_step
+
+
+def resolve_base_model_path_for_tokenizer(model_path: str) -> str:
+    """
+    Adapter-only checkpoints may store `base_model_ref.json` and omit HF config/tokenizer files.
+    In that case, use the referenced base model path for tokenizer/processor loading.
+    """
+    base_ref = os.path.join(model_path, "base_model_ref.json")
+    if not os.path.isfile(base_ref):
+        return model_path
+    try:
+        with open(base_ref, "r", encoding="utf-8") as f:
+            ref = json.load(f)
+        base_model_path = (ref.get("base_model_path") or "").strip()
+    except Exception:
+        base_model_path = ""
+    return base_model_path or model_path
+
+
+def apply_resume_if_configured(config) -> None:
+    """
+    Mutate config in-place to resume from the latest/explicit checkpoint.
+
+    Supported:
+      - `trainer.resume_from=/path/to/.../actor/global_step_N`
+      - `trainer.resume_from=auto|latest` or `trainer.auto_resume=True` (uses `trainer.default_local_dir/actor/`)
+      - `trainer.resume_from=/path/to/experiment_root` (expects `actor/global_step_*` under it)
+      - `trainer.resume_from=/path/to/experiment_root/actor` (expects `global_step_*` under it)
+    """
+    from omegaconf import open_dict
+
+    resume_from = str(getattr(config.trainer, "resume_from", "") or "").strip()
+    auto_resume = bool(config.trainer.get("auto_resume", False))
+
+    if not resume_from and not auto_resume:
+        return
+
+    is_auto = auto_resume or (resume_from.lower() in {"auto", "latest"})
+    strict = bool(resume_from and not is_auto)
+
+    if is_auto:
+        candidate = (str(config.trainer.default_local_dir) if not resume_from else resume_from).rstrip("/")
+    else:
+        candidate = resume_from.rstrip("/")
+
+    if not candidate:
+        return
+
+    # Normalize to actor root / checkpoint dir.
+    actor_root = candidate
+    if os.path.isdir(candidate) and os.path.basename(os.path.normpath(candidate)) != "actor":
+        maybe_actor = os.path.join(candidate, "actor")
+        if os.path.isdir(maybe_actor):
+            actor_root = maybe_actor
+
+    actor_ckpt_dir = None
+    ckpt_step = parse_global_step_dir(actor_root)
+    if ckpt_step is not None:
+        actor_ckpt_dir = actor_root
+    else:
+        actor_ckpt_dir, ckpt_step = find_latest_global_step_dir(actor_root)
+
+    if not actor_ckpt_dir or ckpt_step is None:
+        msg = f"[resume] No checkpoints found under: {actor_root}; starting fresh."
+        if strict:
+            raise FileNotFoundError(msg)
+        print(msg)
+        return
+
+    resume_global_steps = int(ckpt_step + 1)
+    processor_path = resolve_base_model_path_for_tokenizer(actor_ckpt_dir)
+
+    with open_dict(config):
+        config.trainer.resume_global_steps = resume_global_steps
+        config.actor_rollout_ref.model.path = actor_ckpt_dir
+        config.actor_rollout_ref.model.resume = True
+        # If LoRA is enabled, default to loading adapter weights from the resumed checkpoint.
+        try:
+            lora_rank = int(getattr(config.actor_rollout_ref.model, "lora_rank", 0) or 0)
+        except Exception:
+            lora_rank = 0
+        if lora_rank > 0 and hasattr(config.actor_rollout_ref.model, "lora_load_from_checkpoint"):
+            config.actor_rollout_ref.model.lora_load_from_checkpoint = True
+        # Keep rollout processor in sync with the resumed policy checkpoint.
+        if hasattr(config.actor_rollout_ref, "rollout") and hasattr(config.actor_rollout_ref.rollout, "pretrained_checkpoint"):
+            config.actor_rollout_ref.rollout.pretrained_checkpoint = processor_path
+
+        # Best-effort: resume critic/prm if matching step exists.
+        default_local_dir = str(config.trainer.default_local_dir)
+        critic_dir = os.path.join(default_local_dir, "critic", f"global_step_{ckpt_step}")
+        if os.path.isdir(critic_dir):
+            config.critic.model.path = critic_dir
+        prm_dir = os.path.join(default_local_dir, "prm", f"global_step_{ckpt_step}")
+        if os.path.isdir(prm_dir) and hasattr(config, "reward_model"):
+            config.reward_model.model.path = prm_dir
+
+    print(f"[resume] actor={actor_ckpt_dir} (step={ckpt_step}) -> resume_global_steps={resume_global_steps}")
+
 class RobRewardManager():
     """The reward manager.
     """
@@ -155,12 +281,18 @@ def main_task(config):
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
 
+    # Apply resume before any worker/tokenizer initialization.
+    apply_resume_if_configured(config)
+
     # download the checkpoint from hdfs
     local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
+    tokenizer_base = resolve_base_model_path_for_tokenizer(local_path)
+    if tokenizer_base != local_path:
+        tokenizer_base = copy_local_path_from_hdfs(tokenizer_base)
 
     # instantiate tokenizer
     from verl.utils import hf_tokenizer
-    tokenizer = hf_tokenizer(local_path)
+    tokenizer = hf_tokenizer(tokenizer_base)
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':

@@ -289,6 +289,45 @@ class RayTrainer(object):
 
         self._create_dataloader()
 
+    def maybe_save_final_checkpoint(self, *, global_steps: int) -> None:
+        """
+        Ensure the last completed training step is checkpointed.
+
+        Behavior:
+          - If `trainer.save_freq > 0`, save at the end only when the last step wasn't already saved.
+          - If `trainer.save_final == True`, always save at the end (even when `save_freq <= 0`).
+        """
+        save_freq = int(self.config.trainer.get("save_freq", -1) or -1)
+        save_final = bool(self.config.trainer.get("save_final", False))
+
+        if global_steps <= 0:
+            return
+
+        already_saved_by_freq = bool(save_freq > 0 and (global_steps % save_freq) == 0)
+        if not save_final and (save_freq <= 0 or already_saved_by_freq):
+            return
+
+        final_step = int(global_steps - 1)
+
+        actor_local_path = os.path.join(
+            self.config.trainer.default_local_dir, "actor", f"global_step_{final_step}"
+        )
+        self.actor_rollout_wg.save_checkpoint(actor_local_path, None)
+
+        if self.use_critic:
+            critic_local_path = os.path.join(
+                self.config.trainer.default_local_dir, "critic", f"global_step_{final_step}"
+            )
+            self.critic_wg.save_checkpoint(critic_local_path, None)
+
+        if self.use_rm:
+            prm_local_path = os.path.join(
+                self.config.trainer.default_local_dir, "prm", f"global_step_{final_step}"
+            )
+            self.rm_wg.save_checkpoint(prm_local_path, None)
+
+        print(f"[ckpt] Saved final checkpoint at global_step={final_step}")
+
     def _create_dataloader(self):   # next fix
         from torch.utils.data import DataLoader
         # TODO: we have to make sure the batch size is divisible by the dp size
@@ -513,7 +552,7 @@ class RayTrainer(object):
                           wandb_mode=self.config.trainer.wandb_mode,
                           config=OmegaConf.to_container(self.config, resolve=True))
 
-        global_steps = 0
+        global_steps = int(self.config.trainer.get("resume_global_steps", 0) or 0)
         target_steps = self.config.trainer.get('total_steps', None)
         if target_steps is not None:
             target_steps = int(target_steps)
@@ -536,7 +575,7 @@ class RayTrainer(object):
         crl_success_before_train: dict[int, float] = {}
         crl_ckpt_saved_at_step: dict[int, int] = {}
 
-        def _save_crl_checkpoints(task_id: int, step: int) -> None:
+        def save_crl_checkpoints(task_id: int, step: int) -> None:
             if not crl_save_on_switch:
                 return
             task_id = int(task_id)
@@ -871,7 +910,10 @@ class RayTrainer(object):
                         print(f"[CRL] task_id={crl_current_task_id} success_after_train={task_success:.4f}")
 
                     if crl_current_task_id is not None and global_steps >= crl_next_switch_step:
-                        _save_crl_checkpoints(task_id=int(crl_current_task_id), step=int(global_steps))
+                        # `global_steps` is incremented at the end of each update; the last completed update is
+                        # `global_steps - 1`, which matches the conventional `global_step_{k}` checkpoint naming.
+                        if global_steps > 0:
+                            save_crl_checkpoints(task_id=int(crl_current_task_id), step=int(global_steps - 1))
 
                     if (target_steps is None or global_steps < target_steps) and global_steps >= crl_next_switch_step and (crl_task_idx + 1) < len(crl_task_ids):
                         crl_task_idx += 1
@@ -929,7 +971,10 @@ class RayTrainer(object):
                 print(f"[CRL] mean_success_after_train={mean_success:.4f} over task_ids={ordered}")
 
         if use_crl and crl_current_task_id is not None:
-            _save_crl_checkpoints(task_id=int(crl_current_task_id), step=int(global_steps))
+            if global_steps > 0:
+                save_crl_checkpoints(task_id=int(crl_current_task_id), step=int(global_steps - 1))
+
+        self.maybe_save_final_checkpoint(global_steps=int(global_steps))
 
     def filter_format(self, reward_tensor, batch, n_samples):
         """
