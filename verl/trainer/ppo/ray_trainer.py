@@ -82,6 +82,54 @@ import torch
 from verl.utils.torch_functional import masked_mean
 
 
+def _is_crl_enabled(config) -> bool:
+    return bool(config.data.use_crl)
+
+
+def _resolve_crl_ckpt_layout(config, default_local_dir: str) -> str:
+    """
+    Keep checkpoint layout consistent with `verl/trainer/main_ppo.py`:
+
+    - `legacy`: store CRL main checkpoints in `default_local_dir/actor/` (can mix with non-CRL runs).
+    - `crl`: store CRL main checkpoints in `default_local_dir/crl/main/actor/`.
+    """
+    layout = str(config.trainer.ckpt_layout).strip().lower()
+    if layout not in {"legacy", "crl"}:
+        raise ValueError(f"Unsupported trainer.ckpt_layout={layout!r}; expected 'legacy' or 'crl'.")
+    return layout
+
+
+def resolve_main_ckpt_root(config) -> str:
+    """
+    Return the directory that contains `actor/`, `critic/`, `prm/` for the main training checkpoints.
+
+    - Non-CRL runs: `default_local_dir`
+    - CRL runs (layout=crl): `default_local_dir/crl/main`
+    - CRL runs (layout=legacy): `default_local_dir`
+    """
+    default_local_dir = str(config.trainer.default_local_dir)
+    if not _is_crl_enabled(config):
+        return default_local_dir
+    layout = _resolve_crl_ckpt_layout(config, default_local_dir=default_local_dir)
+    if layout == "legacy":
+        return default_local_dir
+    return os.path.join(default_local_dir, "crl", "main")
+
+
+def resolve_crl_task_ckpt_root(config, task_id: int) -> str:
+    """
+    Return the directory used for per-task CRL snapshots.
+
+    - layout=crl: `default_local_dir/crl/tasks/task_{task_id}`
+    - layout=legacy: `default_local_dir/crl/tasks/task_{task_id}` (keeps a consistent tree shape)
+    """
+    default_local_dir = str(config.trainer.default_local_dir)
+    layout = _resolve_crl_ckpt_layout(config, default_local_dir=default_local_dir)
+    if layout not in {"legacy", "crl"}:
+        raise ValueError(f"Unexpected trainer.ckpt_layout={layout!r}")
+    return os.path.join(default_local_dir, "crl", "tasks", f"task_{int(task_id)}")
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl', action_token_len=7, action_chunks_len=8):
     responses = data.batch['responses']
     
@@ -309,20 +357,21 @@ class RayTrainer(object):
 
         final_step = int(global_steps - 1)
 
+        ckpt_root = resolve_main_ckpt_root(self.config)
         actor_local_path = os.path.join(
-            self.config.trainer.default_local_dir, "actor", f"global_step_{final_step}"
+            ckpt_root, "actor", f"global_step_{final_step}"
         )
         self.actor_rollout_wg.save_checkpoint(actor_local_path, None)
 
         if self.use_critic:
             critic_local_path = os.path.join(
-                self.config.trainer.default_local_dir, "critic", f"global_step_{final_step}"
+                ckpt_root, "critic", f"global_step_{final_step}"
             )
             self.critic_wg.save_checkpoint(critic_local_path, None)
 
         if self.use_rm:
             prm_local_path = os.path.join(
-                self.config.trainer.default_local_dir, "prm", f"global_step_{final_step}"
+                ckpt_root, "prm", f"global_step_{final_step}"
             )
             self.rm_wg.save_checkpoint(prm_local_path, None)
 
@@ -333,9 +382,7 @@ class RayTrainer(object):
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.utils.dataset.rob_dataset import LIBERO_Dataset, Robotwin_Dataset, collate_fn
         if "libero" in self.config.data.task_suite_name:
-            task_ids = None
-            if hasattr(self.config.data, "get"):
-                task_ids = self.config.data.get("task_ids", None)
+            task_ids = self.config.data.task_ids
             if task_ids is not None and isinstance(task_ids, ListConfig):
                 task_ids = list(task_ids)
             self.train_dataset = LIBERO_Dataset(self.config.data.task_suite_name,
@@ -562,7 +609,7 @@ class RayTrainer(object):
         batch_size = self.config.data.train_batch_size
         n_samples = self.config.data.n_samples
 
-        use_crl = bool(getattr(self.config.data, "use_crl", False))
+        use_crl = bool(self.config.data.use_crl)
         crl_eval_on_switch = bool(self.config.trainer.get("crl_eval_on_switch", False))
         crl_eval_on_enter = bool(self.config.trainer.get("crl_eval_on_enter", False))
         crl_save_on_switch = bool(self.config.trainer.get("crl_save_on_switch", False))
@@ -583,8 +630,7 @@ class RayTrainer(object):
             if task_id in crl_ckpt_saved_at_step:
                 return
 
-            tag = f"task_{task_id}"
-            base_dir = os.path.join(self.config.trainer.default_local_dir, "crl", tag)
+            base_dir = resolve_crl_task_ckpt_root(self.config, task_id=task_id)
             actor_local_path = os.path.join(base_dir, "actor", f"global_step_{step}")
             self.actor_rollout_wg.save_checkpoint(actor_local_path, None)
             if self.use_critic:
@@ -594,16 +640,14 @@ class RayTrainer(object):
                 prm_local_path = os.path.join(base_dir, "prm", f"global_step_{step}")
                 self.rm_wg.save_checkpoint(prm_local_path, None)
             crl_ckpt_saved_at_step[task_id] = step
-            print(f"[CRL] Saved checkpoints for {tag} at global_step={step}")
+            print(f"[CRL] Saved task checkpoints at: {base_dir} (global_step={step})")
 
         if use_crl:
             if "libero" not in self.config.data.task_suite_name:
                 raise NotImplementedError("`data.use_crl=True` is only supported for LIBERO task suites right now.")
 
             # Determine task order.
-            raw_task_ids = None
-            if hasattr(self.config.data, "get"):
-                raw_task_ids = self.config.data.get("crl_task_ids", None)
+            raw_task_ids = self.config.data.crl_task_ids
             if raw_task_ids is not None:
                 if isinstance(raw_task_ids, ListConfig):
                     raw_task_ids = list(raw_task_ids)
@@ -866,20 +910,21 @@ class RayTrainer(object):
                     logger.log(data=metrics, step=global_steps)
 
                 if self.config.trainer.save_freq > 0 and (global_steps + 1) % self.config.trainer.save_freq == 0:
-                    actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
+                    ckpt_root = resolve_main_ckpt_root(self.config)
+                    actor_local_path = os.path.join(ckpt_root, 'actor',
                                                     f'global_step_{global_steps}')
                     actor_remote_path = None #if self.config.trainer.default_hdfs_dir is None else os.path.join(
                         # self.config.trainer.default_hdfs_dir, 'actor')
                     self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path)
 
                     if self.use_critic:
-                        critic_local_path = os.path.join(self.config.trainer.default_local_dir, 'critic',
+                        critic_local_path = os.path.join(ckpt_root, 'critic',
                                                          f'global_step_{global_steps}')
                         critic_remote_path = None #if self.config.trainer.default_hdfs_dir is None else os.path.join(
                             # self.config.trainer.default_hdfs_dir, 'critic')
                         self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
                     if self.use_rm:
-                        prm_local_path = os.path.join(self.config.trainer.default_local_dir, 'prm',
+                        prm_local_path = os.path.join(ckpt_root, 'prm',
                                                          f'global_step_{global_steps}')
                         prm_remote_path = None #if self.config.trainer.default_hdfs_dir is None else os.path.join(
                             # self.config.trainer.default_hdfs_dir, 'critic')

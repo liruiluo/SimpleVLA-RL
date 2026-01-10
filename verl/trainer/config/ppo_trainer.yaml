@@ -279,9 +279,14 @@ trainer:
   # Resume support:
   # - If set to a checkpoint dir (e.g. `.../actor/global_step_99`), load weights from it and continue with
   #   `global_steps` starting at 100.
-  # - If set to `auto`/`latest` OR `auto_resume=True`, pick the latest checkpoint under `default_local_dir/actor/`.
+  # - If set to `auto`/`latest` OR `auto_resume=True`, pick the latest checkpoint under the active ckpt root.
+  #   For CRL runs, the default is to keep checkpoints under `default_local_dir/crl/main/` (auto-detected).
   resume_from: null
   auto_resume: True
+  # Checkpoint layout for CRL runs (`data.use_crl=True`):
+  # - `crl` (default): store CRL main checkpoints in `default_local_dir/crl/main/actor/` (recommended to avoid collisions).
+  # - `legacy`: store CRL main checkpoints in `default_local_dir/actor/` (can mix with non-CRL runs).
+  ckpt_layout: crl
   # If `data.use_crl=True`, optionally set how many RL updates to spend per task before moving to the next.
   # If null, we split `trainer.total_steps` evenly across `data.crl_task_ids` (ceil).
   crl_steps_per_task: null

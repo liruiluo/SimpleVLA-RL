@@ -65,13 +65,39 @@ def resolve_base_model_path_for_tokenizer(model_path: str) -> str:
     base_ref = os.path.join(model_path, "base_model_ref.json")
     if not os.path.isfile(base_ref):
         return model_path
-    try:
-        with open(base_ref, "r", encoding="utf-8") as f:
-            ref = json.load(f)
-        base_model_path = (ref.get("base_model_path") or "").strip()
-    except Exception:
-        base_model_path = ""
+    with open(base_ref, "r", encoding="utf-8") as f:
+        ref = json.load(f)
+    base_model_path = (ref.get("base_model_path") or "").strip()
     return base_model_path or model_path
+
+
+def _is_crl_enabled(config) -> bool:
+    return bool(config.data.use_crl)
+
+
+def _resolve_crl_ckpt_layout(config, default_local_dir: str) -> str:
+    """
+    Decide how CRL checkpoints are laid out on disk.
+
+    Supported:
+      - `trainer.ckpt_layout=legacy`: store CRL main checkpoints in `default_local_dir/actor/`.
+      - `trainer.ckpt_layout=crl`: store CRL main checkpoints in `default_local_dir/crl/main/actor/`.
+    """
+    layout = str(config.trainer.ckpt_layout).strip().lower()
+    if layout not in {"legacy", "crl"}:
+        raise ValueError(f"Unsupported trainer.ckpt_layout={layout!r}; expected 'legacy' or 'crl'.")
+    return layout
+
+
+def _resolve_main_ckpt_root(config) -> str:
+    """Return the directory that contains `actor/`, `critic/`, `prm/` for the *main* training checkpoints."""
+    default_local_dir = str(config.trainer.default_local_dir)
+    if not _is_crl_enabled(config):
+        return default_local_dir
+    layout = _resolve_crl_ckpt_layout(config, default_local_dir=default_local_dir)
+    if layout == "legacy":
+        return default_local_dir
+    return os.path.join(default_local_dir, "crl", "main")
 
 
 def apply_resume_if_configured(config) -> None:
@@ -80,20 +106,21 @@ def apply_resume_if_configured(config) -> None:
 
     Supported:
       - `trainer.resume_from=/path/to/.../actor/global_step_N`
-      - `trainer.resume_from=auto|latest` or `trainer.auto_resume=True` (uses `trainer.default_local_dir/actor/`)
+      - `trainer.resume_from=auto|latest` or `trainer.auto_resume=True` (CRL uses `trainer.default_local_dir/crl/main/actor/`)
       - `trainer.resume_from=/path/to/experiment_root` (expects `actor/global_step_*` under it)
       - `trainer.resume_from=/path/to/experiment_root/actor` (expects `global_step_*` under it)
     """
     from omegaconf import open_dict
 
-    resume_from = str(getattr(config.trainer, "resume_from", "") or "").strip()
-    auto_resume = bool(config.trainer.get("auto_resume", False))
+    resume_from = str(config.trainer.resume_from or "").strip()
+    auto_resume = bool(config.trainer.auto_resume)
 
     if not resume_from and not auto_resume:
         return
 
     is_auto = auto_resume or (resume_from.lower() in {"auto", "latest"})
     strict = bool(resume_from and not is_auto)
+    explicit_resume_path = bool(resume_from and resume_from.lower() not in {"auto", "latest"})
 
     if is_auto:
         candidate = (str(config.trainer.default_local_dir) if not resume_from else resume_from).rstrip("/")
@@ -105,10 +132,16 @@ def apply_resume_if_configured(config) -> None:
 
     # Normalize to actor root / checkpoint dir.
     actor_root = candidate
-    if os.path.isdir(candidate) and os.path.basename(os.path.normpath(candidate)) != "actor":
-        maybe_actor = os.path.join(candidate, "actor")
-        if os.path.isdir(maybe_actor):
-            actor_root = maybe_actor
+    if is_auto and _is_crl_enabled(config) and not explicit_resume_path:
+        # For CRL, the recommended layout is:
+        #   default_local_dir/crl/main/actor/global_step_*
+        main_root = _resolve_main_ckpt_root(config)
+        actor_root = os.path.join(main_root, "actor")
+    else:
+        if os.path.isdir(candidate) and os.path.basename(os.path.normpath(candidate)) != "actor":
+            maybe_actor = os.path.join(candidate, "actor")
+            if os.path.isdir(maybe_actor):
+                actor_root = maybe_actor
 
     actor_ckpt_dir = None
     ckpt_step = parse_global_step_dir(actor_root)
@@ -132,23 +165,19 @@ def apply_resume_if_configured(config) -> None:
         config.actor_rollout_ref.model.path = actor_ckpt_dir
         config.actor_rollout_ref.model.resume = True
         # If LoRA is enabled, default to loading adapter weights from the resumed checkpoint.
-        try:
-            lora_rank = int(getattr(config.actor_rollout_ref.model, "lora_rank", 0) or 0)
-        except Exception:
-            lora_rank = 0
-        if lora_rank > 0 and hasattr(config.actor_rollout_ref.model, "lora_load_from_checkpoint"):
+        lora_rank = int(config.actor_rollout_ref.model.lora_rank)
+        if lora_rank > 0:
             config.actor_rollout_ref.model.lora_load_from_checkpoint = True
         # Keep rollout processor in sync with the resumed policy checkpoint.
-        if hasattr(config.actor_rollout_ref, "rollout") and hasattr(config.actor_rollout_ref.rollout, "pretrained_checkpoint"):
-            config.actor_rollout_ref.rollout.pretrained_checkpoint = processor_path
+        config.actor_rollout_ref.rollout.pretrained_checkpoint = processor_path
 
         # Best-effort: resume critic/prm if matching step exists.
-        default_local_dir = str(config.trainer.default_local_dir)
-        critic_dir = os.path.join(default_local_dir, "critic", f"global_step_{ckpt_step}")
+        main_ckpt_root = _resolve_main_ckpt_root(config)
+        critic_dir = os.path.join(main_ckpt_root, "critic", f"global_step_{ckpt_step}")
         if os.path.isdir(critic_dir):
             config.critic.model.path = critic_dir
-        prm_dir = os.path.join(default_local_dir, "prm", f"global_step_{ckpt_step}")
-        if os.path.isdir(prm_dir) and hasattr(config, "reward_model"):
+        prm_dir = os.path.join(main_ckpt_root, "prm", f"global_step_{ckpt_step}")
+        if os.path.isdir(prm_dir):
             config.reward_model.model.path = prm_dir
 
     print(f"[resume] actor={actor_ckpt_dir} (step={ckpt_step}) -> resume_global_steps={resume_global_steps}")
@@ -233,7 +262,7 @@ def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
         runtime_env = None
-        runtime_env_path = str(getattr(config.trainer, "runtime_env", "") or "").strip()
+        runtime_env_path = str(config.trainer.runtime_env or "").strip()
         if runtime_env_path and runtime_env_path.lower() not in {"none", "null"}:
             if os.path.isfile(runtime_env_path):
                 with open(runtime_env_path, 'r') as f:
