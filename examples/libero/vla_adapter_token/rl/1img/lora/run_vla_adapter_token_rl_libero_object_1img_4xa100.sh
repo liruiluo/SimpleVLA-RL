@@ -48,13 +48,24 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # Ray memory knobs (avoid extra background processes).
 export VERL_RAY_DISABLE_DASHBOARD="${VERL_RAY_DISABLE_DASHBOARD:-1}"
 
+# Avoid CPU oversubscription: LIBERO rollouts spawn many subprocesses, and BLAS/OpenMP defaults
+# can create dozens of threads per process (slow + high host RAM).
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
+
 bash "${REPO_ROOT}/examples/libero/vla_adapter_token/rl/1img/lora/run_vla_adapter_token_rl_libero_object_1img.sh" \
   data.train_batch_size=32 \
   data.val_batch_size=32 \
+  data.n_samples=4 \
   actor_rollout_ref.rollout.micro_batch_size=4 \
+  actor_rollout_ref.actor.ppo_micro_batch_size=32 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \
   actor_rollout_ref.ref.log_prob_micro_batch_size=64 \
   actor_rollout_ref.actor.fsdp_config.grad_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
   actor_rollout_ref.ref.fsdp_config.param_offload=False \
+  trainer.ckpt_layout=rl \
   "$@"

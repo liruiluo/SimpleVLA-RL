@@ -335,9 +335,15 @@ class RobotwinEnvWrapper:
 
 def env_worker(task_name, task_id, trial_id, config, input_queue, output_queue, is_valid, global_steps, max_steps):
     """Worker process for Libero environments"""
-    from verl.utils.stdout_filter import filter_std_streams
     import os
     import sys
+    # IMPORTANT: this subprocess only runs simulation + image preprocessing. It must not touch CUDA.
+    # TensorFlow is used for image resizing and will attempt to initialize GPUs if visible, which can hang
+    # or steal GPU memory from the policy workers. Keep it CPU-only here.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+    from verl.utils.stdout_filter import filter_std_streams
 
     noisy_substrings = (
         "[Warning]: datasets path ",

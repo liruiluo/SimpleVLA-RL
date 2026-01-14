@@ -80,12 +80,12 @@ def _resolve_crl_ckpt_layout(config, default_local_dir: str) -> str:
     Decide how CRL checkpoints are laid out on disk.
 
     Supported:
-      - `trainer.ckpt_layout=legacy`: store CRL main checkpoints in `default_local_dir/actor/`.
+      - `trainer.ckpt_layout=rl`: store CRL main checkpoints in `default_local_dir/actor/`.
       - `trainer.ckpt_layout=crl`: store CRL main checkpoints in `default_local_dir/crl/main/actor/`.
     """
     layout = str(config.trainer.ckpt_layout).strip().lower()
-    if layout not in {"legacy", "crl"}:
-        raise ValueError(f"Unsupported trainer.ckpt_layout={layout!r}; expected 'legacy' or 'crl'.")
+    if layout not in {"rl", "crl"}:
+        raise ValueError(f"Unsupported trainer.ckpt_layout={layout!r}; expected 'rl' or 'crl'.")
     return layout
 
 
@@ -95,7 +95,7 @@ def _resolve_main_ckpt_root(config) -> str:
     if not _is_crl_enabled(config):
         return default_local_dir
     layout = _resolve_crl_ckpt_layout(config, default_local_dir=default_local_dir)
-    if layout == "legacy":
+    if layout == "rl":
         return default_local_dir
     return os.path.join(default_local_dir, "crl", "main")
 

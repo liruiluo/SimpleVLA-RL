@@ -90,12 +90,12 @@ def _resolve_crl_ckpt_layout(config, default_local_dir: str) -> str:
     """
     Keep checkpoint layout consistent with `verl/trainer/main_ppo.py`:
 
-    - `legacy`: store CRL main checkpoints in `default_local_dir/actor/` (can mix with non-CRL runs).
+    - `rl`: store CRL main checkpoints in `default_local_dir/actor/` (can mix with non-CRL runs).
     - `crl`: store CRL main checkpoints in `default_local_dir/crl/main/actor/`.
     """
     layout = str(config.trainer.ckpt_layout).strip().lower()
-    if layout not in {"legacy", "crl"}:
-        raise ValueError(f"Unsupported trainer.ckpt_layout={layout!r}; expected 'legacy' or 'crl'.")
+    if layout not in {"rl", "crl"}:
+        raise ValueError(f"Unsupported trainer.ckpt_layout={layout!r}; expected 'rl' or 'crl'.")
     return layout
 
 
@@ -105,13 +105,13 @@ def resolve_main_ckpt_root(config) -> str:
 
     - Non-CRL runs: `default_local_dir`
     - CRL runs (layout=crl): `default_local_dir/crl/main`
-    - CRL runs (layout=legacy): `default_local_dir`
+    - CRL runs (layout=rl): `default_local_dir`
     """
     default_local_dir = str(config.trainer.default_local_dir)
     if not _is_crl_enabled(config):
         return default_local_dir
     layout = _resolve_crl_ckpt_layout(config, default_local_dir=default_local_dir)
-    if layout == "legacy":
+    if layout == "rl":
         return default_local_dir
     return os.path.join(default_local_dir, "crl", "main")
 
@@ -121,12 +121,10 @@ def resolve_crl_task_ckpt_root(config, task_id: int) -> str:
     Return the directory used for per-task CRL snapshots.
 
     - layout=crl: `default_local_dir/crl/tasks/task_{task_id}`
-    - layout=legacy: `default_local_dir/crl/tasks/task_{task_id}` (keeps a consistent tree shape)
+    - layout=rl: `default_local_dir/crl/tasks/task_{task_id}` (keeps a consistent tree shape)
     """
     default_local_dir = str(config.trainer.default_local_dir)
-    layout = _resolve_crl_ckpt_layout(config, default_local_dir=default_local_dir)
-    if layout not in {"legacy", "crl"}:
-        raise ValueError(f"Unexpected trainer.ckpt_layout={layout!r}")
+    _resolve_crl_ckpt_layout(config, default_local_dir=default_local_dir)
     return os.path.join(default_local_dir, "crl", "tasks", f"task_{int(task_id)}")
 
 

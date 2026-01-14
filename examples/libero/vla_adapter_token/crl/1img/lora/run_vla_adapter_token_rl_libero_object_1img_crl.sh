@@ -2,8 +2,8 @@
 set -euo pipefail
 set -x
 
-# Make CUDA errors synchronous for clearer stack traces (debugging).
-export CUDA_LAUNCH_BLOCKING=1
+# Debugging only. Set `CUDA_LAUNCH_BLOCKING=1` to make CUDA errors synchronous (significantly slower).
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 
 # Enable NaN/Inf debug checks in rollout (set VERL_DEBUG_NAN=0 to disable).
 export VERL_DEBUG_NAN="${VERL_DEBUG_NAN:-1}"
@@ -37,7 +37,7 @@ if [ -z "${REPO_ROOT:-}" ]; then
     fi
 fi
 
-_args=(data.use_crl=True data.val_batch_size=32 trainer.crl_eval_on_switch=True trainer.crl_save_on_switch=True actor_rollout_ref.model.save_merged_model=False)
+_args=(data.use_crl=True trainer.ckpt_layout=crl data.val_batch_size=32 trainer.crl_eval_on_switch=True trainer.crl_save_on_switch=True actor_rollout_ref.model.save_merged_model=False)
 if [ -n "${CRL_STEPS_PER_TASK:-}" ]; then
   _args+=(trainer.crl_steps_per_task="${CRL_STEPS_PER_TASK}")
 fi
